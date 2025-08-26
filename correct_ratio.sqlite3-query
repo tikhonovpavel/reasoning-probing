@@ -1,0 +1,23 @@
+-- database: ./reasoning_traces.sqlite
+SELECT
+    SUM(is_correct),
+    COUNT(*),
+    SUM(is_correct) / COUNT(*)
+
+FROM
+    reasoning_traces_qpqa
+WHERE
+    model_path = 'Qwen/Qwen3-32B';
+
+
+
+-------------
+
+
+SELECT
+    *
+
+FROM
+    reasoning_traces_qpqa
+WHERE
+    model_path = 'Qwen/Qwen3-8B';

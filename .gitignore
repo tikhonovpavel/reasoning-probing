@@ -1,0 +1,14 @@
+__pycache__/
+*.pt
+probe_data/
+.venv/
+.vscode/
+
+.neptune/
+plots/
+probe_predictions/
+probe-visualizer/
+related_papers/
+unembedding_cache/
+temp.csv
+reasoning_traces.sqlite
