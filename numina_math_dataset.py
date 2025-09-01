@@ -33,27 +33,24 @@ def extract_final_number(text: str):
     except (ValueError, TypeError):
         return None
 
-print("\nFiltering the entire dataset... (progress bar is automatic)")
+print("\nFiltering first 1000 examples of dataset... (progress bar is automatic)")
 
 def is_numerical(example):
     return extract_final_number(example['ground_truth']) is not None
 
-filtered_dataset = train_dataset.filter(is_numerical, num_proc=100) 
+filtered_dataset = train_dataset.select(range(1000)).filter(is_numerical, num_proc=100) 
 
 print("\nFiltering complete!")
 print(f"Total examples found with a numerical answer: {len(filtered_dataset):,}")
 print("=" * 100)
 
-print("Displaying the first 10 found examples:\n")
+num_examples = 3
+print(f"Displaying the first {num_examples} found examples:\n")
 
-for i, d in enumerate(filtered_dataset.select(range(10))):
+for i, d in enumerate(filtered_dataset.select(range(num_examples))):
     print(f"----------- Example {i+1} -----------")
-    print("Prompt:")
-    print(d['prompt'])
-    print('-' * 50)
-    print("Ground Truth:")
-    print(d['ground_truth'])
-
+    print("Plain dataset item:")
+    print(d)
     extracted_num = extract_final_number(d['ground_truth'])
     print(f"----> Extracted Number for Regression: {extracted_num}")
     print("=" * 100)
