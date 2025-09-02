@@ -14,7 +14,7 @@ import seaborn as sns
 import datetime
 import itertools
 
-def setup(model_name, seed, cache_dir):
+def setup(model_name, seed, cache_dir, device):
     """Set up model, tokenizer, and dataset."""
     print("Setting up model, tokenizer, and dataset...")
     
@@ -30,7 +30,7 @@ def setup(model_name, seed, cache_dir):
         config=config,
         torch_dtype=torch.bfloat16,
         cache_dir=cache_dir
-    ).to("cuda")
+    ).to(device)
     model.eval()
 
     dataset = GPQADataset(split="train", seed=seed, cache_dir=cache_dir)
@@ -88,7 +88,17 @@ def find_target_indices(tokenizer, full_prompt, target_text):
         for i in range(len(encoded_full) - len(encoded_target) + 1):
             if encoded_full[i:i+len(encoded_target)] == encoded_target:
                 return list(range(i, i + len(encoded_target))), torch.tensor([encoded_full], dtype=torch.long)
-        return None, None
+        
+        error_message = (
+            "\n" + "="*80 + "\n"
+            "ERROR: `find_target_indices` failed. Could not find `target_text` via string matching or token matching.\n"
+            f"--- Target Text (len={len(target_text)}) ---\n{target_text}\n"
+            f"--- Full Prompt (len={len(full_prompt)}) ---\n{full_prompt}\n"
+            "--- Tokenization Debug ---\n"
+            f"Target tokens: {tokenizer.convert_ids_to_tokens(encoded_target)}\n"
+            "="*80
+        )
+        raise ValueError(error_message)
 
     target_end_char = target_start_char + len(target_text)
 
@@ -112,19 +122,27 @@ def get_hidden_states(model, tokenizer, sample, model_name, reasoning_stub, reve
     
     if 'QwQ' in model_name:
         assistant_content = f"{reasoning_stub} {revealing_answer_prompt} {answer_letter}" # there's no <think></think> tokens in QwQ
-    elif ('Qwen2.5' in model_name) or ('Qwen3' in model_name):
-        assistant_content = f"<think>\n{reasoning_stub}\n<think>\n\n{revealing_answer_prompt} {answer_letter}"
+
+        messages = [
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": assistant_content},
+        ]
+
+        full_prompt = tokenizer.apply_chat_template(messages, tokenize=False)
+        
+    elif ('Qwen3' in model_name):
+        messages = [
+            {"role": "user", "content": user_prompt},
+            {"role": "assistant", "content": ''},
+        ]
+
+        full_prompt = tokenizer.apply_chat_template(messages, tokenize=False)
+        full_prompt = full_prompt.replace(
+            '<think>\n\n</think>', f'<think>\n{reasoning_stub} {revealing_answer_prompt} {answer_letter}'
+        )
     else:
         raise NotImplementedError()
 
-
-    messages = [
-        {"role": "user", "content": user_prompt},
-        {"role": "assistant", "content": assistant_content},
-    ]
-
-    full_prompt = tokenizer.apply_chat_template(messages, tokenize=False)
-    
     target_indices, input_ids = find_target_indices(tokenizer, full_prompt, target_text)
     
     if not target_indices:
@@ -300,7 +318,8 @@ def main(
     n_pairs=100,
     seed=42,
     output_dir="results",
-    cache_dir: str = "/mnt/nfs_share/tikhonov/hf_cache"
+    cache_dir: str = "/mnt/nfs_share/tikhonov/hf_cache",
+    device: str = "cuda"
 ):
     """Main function to run the experiment."""
     # --- Setup output directory ---
@@ -314,7 +333,7 @@ def main(
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    model, tokenizer, dataset = setup(model_name, seed, cache_dir)
+    model, tokenizer, dataset = setup(model_name, seed, cache_dir, device)
     num_layers = model.config.num_hidden_layers + 1  # +1 for embedding layer
 
     all_experiment_results = []
@@ -436,34 +455,34 @@ def main(
     print("="*80)
     
     results_per_layer_exp3 = [[] for _ in range(num_layers)]
-    all_target_tokens_exp3 = []
+    all_target_tokens_exp3 = [f"Token {i+1}" for i in range(15)]
 
     for sample1, sample2 in tqdm(same_answer_pairs, desc="Experiment 3"):
-        hidden_states1, target_tokens1 = get_hidden_states(
+        hidden_states1, _ = get_hidden_states(
             model, tokenizer, sample1, model_name, reasoning_stub, revealing_answer_prompt, 
             target_text=sample1['question'], token_limit=15
         )
-        hidden_states2, target_tokens2 = get_hidden_states(
+        hidden_states2, _ = get_hidden_states(
             model, tokenizer, sample2, model_name, reasoning_stub, revealing_answer_prompt, 
             target_text=sample2['question'], token_limit=15
         )
         
-        # Questions are different, so tokens will be different. We need pairs with same tokenization length.
-        if hidden_states1 is None or hidden_states2 is None or hidden_states1.shape[1] != hidden_states2.shape[1]:
-            print("Skipping pair due to question tokenization length mismatch.")
+        if hidden_states1 is None or hidden_states2 is None:
             continue
 
-        if not all_target_tokens_exp3:
-            # For visualization, just use the tokens from the first valid pair
-            all_target_tokens_exp3 = target_tokens1
+        # For this experiment, we only compare pairs where both questions have at least 15 tokens.
+        # This ensures that we are always comparing the first 15 tokens across all pairs.
+        if hidden_states1.shape[1] != 15 or hidden_states2.shape[1] != 15:
+            continue
 
         for layer_idx in range(num_layers):
             sim = F.cosine_similarity(hidden_states1[layer_idx], hidden_states2[layer_idx], dim=-1)
             results_per_layer_exp3[layer_idx].append(sim.cpu().float().numpy())
 
+    processed_pairs_exp3 = len(results_per_layer_exp3[0]) if results_per_layer_exp3 and results_per_layer_exp3[0] else 0
     results_exp3 = process_and_save_results(
         "exp3_same_answer_question", results_per_layer_exp3, all_target_tokens_exp3,
-        model_name, reasoning_stub, revealing_answer_prompt, len(same_answer_pairs), 
+        model_name, reasoning_stub, revealing_answer_prompt, processed_pairs_exp3, 
         seed, run_output_dir
     )
     if results_exp3:
