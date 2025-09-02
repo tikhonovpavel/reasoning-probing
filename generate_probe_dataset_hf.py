@@ -45,24 +45,33 @@ def main(
     layer_indices: Union[int, List[int]] = 40,
     max_prompt_length: int = 4096,
     stride: int = 10,
-    num_samples: int = 5000, # Process all samples by default
+    num_samples: int = 5000,
     cache_dir: str = "/mnt/nfs_share/tikhonov/hf_cache",
     chunk_size: int = 200,
+    extraction_mode: str = "stride",
+    min_paragraph_breaks: int = 10,
+    max_paragraph_breaks: int = 300,
 ):
     """
     Generates a dataset for training a regression probe by running a model over reasoning traces
-    from a Hugging Face dataset, extracting hidden states with a stride, and saving them to a file.
-    
+    from a Hugging Face dataset, extracting hidden states, and saving them to a file.
+
     Args:
         model_name (str): The name of the Hugging Face model to use.
         dataset_name (str): The name of the Hugging Face dataset to use.
         dataset_split (str): The split of the dataset to process.
-        layer_indices (Union[int, List[int]]): The layer or layers from which to extract hidden states.
+        layer_indices (Union[int, List[int]]): Layer(s) from which to extract hidden states.
         max_prompt_length (int): Maximum number of tokens in a prompt to be processed.
-        stride (int): The step size for subsampling hidden states.
-        num_samples (int): The number of samples to process from the dataset (-1 for all).
+        stride (int): The step size for subsampling hidden states (used in 'stride' mode).
+        num_samples (int): The number of samples to process from the dataset.
         chunk_size (int): How many samples to save in each output file chunk.
+        extraction_mode (str): 'stride' or 'paragraph_break'. Determines how hidden states are extracted.
+        min_paragraph_breaks (int): Minimum paragraph breaks for a sample to be included in 'paragraph_break' mode.
+        max_paragraph_breaks (int): Maximum paragraph breaks for a sample to be included in 'paragraph_break' mode.
     """
+    if extraction_mode not in ["stride", "paragraph_break"]:
+        raise ValueError("extraction_mode must be either 'stride' or 'paragraph_break'")
+
     if isinstance(layer_indices, int):
         layer_indices = [layer_indices]
 
@@ -110,15 +119,67 @@ def main(
         example['model_answer_value'] = model_answer_value
         return example
 
+    # Define the paragraph break filter function once
+    def paragraph_break_filter(example):
+        response_text = example.get('response', '')
+        if not isinstance(response_text, str):
+            return False
+        # Use regex to find sequences of 2 or more newlines
+        matches = re.findall(r'\n{2,}', response_text)
+        return min_paragraph_breaks <= len(matches) <= max_paragraph_breaks
+
     final_dataset = []
     total_checked = 0
     with tqdm(total=num_samples, desc="Finding valid samples") as pbar:
         for example in dataset:
             total_checked += 1
+            
+            # Initial validation (numerical answer, etc.)
             processed_example = process_and_validate(example)
-            if processed_example:
-                final_dataset.append(processed_example)
-                pbar.update(1)
+            if not processed_example:
+                continue
+
+            # In paragraph_break mode, we need to pre-calculate token indices for breaks
+            if extraction_mode == 'paragraph_break':
+                # This logic is now correct and robust, using offset_mapping.
+                conversation = [
+                    {"role": "user", "content": processed_example['prompt']},
+                    {"role": "assistant", "content": processed_example['response']},
+                ]
+                full_text = tokenizer.apply_chat_template(
+                    conversation, tokenize=False, add_generation_prompt=False
+                )
+                
+                response_text = processed_example['response']
+                response_char_start = full_text.find(response_text)
+                if response_char_start == -1:
+                    logging.warning(f"Could not find response text in chat template for sample {processed_example.get('problem_id', 'N/A')}. Skipping.")
+                    continue
+
+                encoding = tokenizer(full_text, return_offsets_mapping=True)
+                offset_mapping = encoding['offset_mapping']
+
+                break_char_spans = [
+                    (m.start() + response_char_start, m.end() + response_char_start)
+                    for m in re.finditer(r'\n{2,}', response_text)
+                ]
+                
+                break_token_indices = []
+                for start_char, end_char in break_char_spans:
+                    current_break_tokens = []
+                    for i, (token_start, token_end) in enumerate(offset_mapping):
+                        if token_end > start_char and token_start < end_char:
+                            current_break_tokens.append(i)
+                    if current_break_tokens:
+                        break_token_indices.append(current_break_tokens)
+                
+                processed_example['break_token_indices'] = break_token_indices
+                
+                if not (min_paragraph_breaks <= len(break_token_indices) <= max_paragraph_breaks):
+                    continue
+
+            final_dataset.append(processed_example)
+            pbar.update(1)
             
             pbar.set_postfix({"checked": f"{total_checked}/{len(dataset)}"})
 
@@ -128,10 +189,11 @@ def main(
     logging.info(f"Search complete. Found {len(final_dataset)} valid samples after checking {total_checked} examples.")
 
     if len(final_dataset) == 0:
-        logging.warning("No valid samples found. Exiting.")
+        logging.warning("No valid samples found after filtering. Exiting.")
         return
-    if num_samples > 0 and len(final_dataset) < num_samples:
-        logging.warning(f"Found only {len(final_dataset)} samples, which is less than the requested {num_samples}.")
+    # This warning is no longer needed as the new logic ensures we find the target number if they exist.
+    # if num_samples > 0 and len(final_dataset) < num_samples:
+    #     logging.warning(f"Found only {len(final_dataset)} samples, which is less than the requested {num_samples}.")
 
     # --- Stage 2: Model Loading and Hidden State Extraction ---
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -232,13 +294,36 @@ def main(
             
             seq_hiddens = hidden_states_containers[layer_idx][0].squeeze(0)
             
-            # Subsample with stride
-            relevant_hiddens = seq_hiddens[start_pos::stride]
-            
-            if relevant_hiddens.numel() == 0:
-                continue
+            relevant_hiddens = None
+            relevant_token_ids = None
 
-            relevant_token_ids = input_ids[start_pos::stride]
+            if extraction_mode == 'stride':
+                # Subsample with stride
+                relevant_hiddens = seq_hiddens[start_pos::stride]
+                if relevant_hiddens.numel() > 0:
+                    relevant_token_ids = input_ids[start_pos::stride]
+
+            elif extraction_mode == 'paragraph_break':
+                break_indices = sample.get('break_token_indices', [])
+                
+                if break_indices:
+                    averaged_hiddens = []
+                    # Placeholder for token_ids metadata.
+                    newline_token_id = tokenizer.encode('\n', add_special_tokens=False)[0]
+
+                    for break_group in break_indices:
+                        if not break_group: continue
+                        hiddens_to_average = seq_hiddens[break_group]
+                        averaged_hidden = torch.mean(hiddens_to_average, dim=0)
+                        averaged_hiddens.append(averaged_hidden)
+                    
+                    if averaged_hiddens:
+                        relevant_hiddens = torch.stack(averaged_hiddens)
+                        num_breaks = relevant_hiddens.shape[0]
+                        relevant_token_ids = torch.full((num_breaks,), newline_token_id, dtype=torch.long)
+
+            if relevant_hiddens is None or relevant_hiddens.numel() == 0:
+                continue
 
             all_probe_data_by_layer[layer_idx].append({
                 "hiddens": relevant_hiddens.cpu(),

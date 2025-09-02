@@ -9,7 +9,7 @@ class GPQADataset(Dataset):
     Class for the GPQA dataset, which loads and processes the data upon initialization,
     and then returns samples in the required format.
     """
-    def __init__(self, config_name="gpqa_diamond", split="train", seed=42):
+    def __init__(self, config_name="gpqa_diamond", split="train", seed=42, cache_dir=None):
         """
         Loads and processes the data once.
 
@@ -17,10 +17,12 @@ class GPQADataset(Dataset):
             config_name (str): GPQA dataset configuration ('gpqa_main', 'gpqa_diamond', etc.).
             split (str): Dataset split (e.g., 'train').
             seed (int): Seed for reproducible shuffling of answer choices.
+            cache_dir (str, optional): Directory to cache the dataset. Defaults to None.
         """
         self.config_name = config_name
         self.split = split
         self.seed = seed
+        self.cache_dir = cache_dir
         self.processed_data = self._load_and_process_data()
 
     def _preprocess_text(self, text):
@@ -36,7 +38,7 @@ class GPQADataset(Dataset):
     def _load_and_process_data(self):
         """Loads the raw dataset and converts it into a list of processed dictionaries."""
         # Load the raw dataset
-        raw_dataset = load_dataset("Idavidrein/gpqa", self.config_name, split=self.split)
+        raw_dataset = load_dataset("Idavidrein/gpqa", self.config_name, split=self.split, cache_dir=self.cache_dir)
         
         processed_list = []
         random.seed(self.seed)
