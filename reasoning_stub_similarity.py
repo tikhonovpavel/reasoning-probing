@@ -318,7 +318,7 @@ def main(
     n_pairs=100,
     seed=42,
     output_dir="results",
-    cache_dir: str = "/mnt/nfs_share/tikhonov/hf_cache",
+    cache_dir: str = '/home/tikhonov/.cache/huggingface/hub/',#"/mnt/nfs_share/tikhonov/hf_cache",
     device: str = "cuda"
 ):
     """Main function to run the experiment."""
