@@ -1,0 +1,36 @@
+{
+    "model_name": "Qwen/Qwen3-32B",
+    "task_type": "regression",
+    "probe_type": "attention",
+    "layer": 40,
+    "n_samples_requested": 5000,
+    "num_tokens_to_probe": 11,
+    "target_tokens": [
+        "Okay",
+        ",",
+        "\u0120I",
+        "\u0120have",
+        "\u0120finished",
+        "\u0120thinking",
+        ".",
+        "\u0120The",
+        "\u0120final",
+        "\u0120answer",
+        "\u0120is"
+    ],
+    "target_indices_in_sequence": [
+        79,
+        80,
+        81,
+        82,
+        83,
+        84,
+        85,
+        86,
+        87,
+        88,
+        89
+    ],
+    "hidden_size": 5120,
+    "n_samples_saved": 5000
+}

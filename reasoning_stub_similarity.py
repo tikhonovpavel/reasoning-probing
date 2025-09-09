@@ -14,30 +14,6 @@ import seaborn as sns
 import datetime
 import itertools
 
-def setup(model_name, seed, cache_dir, device):
-    """Set up model, tokenizer, and dataset."""
-    print("Setting up model, tokenizer, and dataset...")
-    
-    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir)
-    config.output_hidden_states = True
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, 
-        config=config,
-        torch_dtype=torch.bfloat16,
-        cache_dir=cache_dir
-    ).to(device)
-    model.eval()
-
-    dataset = GPQADataset(split="train", seed=seed, cache_dir=cache_dir)
-    
-    print("Setup complete.")
-    return model, tokenizer, dataset
-
 def plot_results(results, output_dir, experiment_name, target_tokens):
     """Plots the results and saves them to the output directory."""
     
@@ -333,10 +309,15 @@ def main(
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    model, tokenizer, dataset = setup(model_name, seed, cache_dir, device)
-    num_layers = model.config.num_hidden_layers + 1  # +1 for embedding layer
+    print("Setting up dataset...")
+    dataset = GPQADataset(split="train", seed=seed, cache_dir=cache_dir)
+    print("Dataset setup complete.")
 
-    all_experiment_results = []
+    print("Setting up tokenizer...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    print("Tokenizer setup complete.")
 
     # --- Sanity Check: Assert tokenization consistency ---
     print("\nRunning tokenization sanity check...")
@@ -354,6 +335,27 @@ def main(
             
     print("Tokenization sanity check passed. Assistant prompts are consistent.")
 
+    # --- Create data pairs for experiments ---
+    same_answer_pairs = create_data_pairs(dataset, n_pairs)
+    diff_answer_pairs = create_pairs_different_answers(dataset, n_pairs)
+
+    # --- Load model ---
+    print("\nSetting up model...")
+    config = AutoConfig.from_pretrained(model_name, cache_dir=cache_dir)
+    config.output_hidden_states = True
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, 
+        config=config,
+        torch_dtype=torch.bfloat16,
+        cache_dir=cache_dir
+    ).to(device)
+    model.eval()
+    print("Model setup complete.")
+
+    num_layers = model.config.num_hidden_layers + 1  # +1 for embedding layer
+
+    all_experiment_results = []
+
     # =================================================================================
     # Experiment 1: Same Answer, Full Assistant Prompt
     # =================================================================================
@@ -361,7 +363,6 @@ def main(
     print("Running Experiment 1: Comparing ASSISTANT PROMPTS for pairs with SAME answer.")
     print("="*80)
     
-    same_answer_pairs = create_data_pairs(dataset, n_pairs)
     results_per_layer_exp1 = [[] for _ in range(num_layers)]
     all_target_tokens_exp1 = []
 
@@ -403,7 +404,6 @@ def main(
     print("Running Experiment 2: Comparing REASONING part of ASSISTANT PROMPTS for pairs with DIFFERENT answers.")
     print("="*80)
 
-    diff_answer_pairs = create_pairs_different_answers(dataset, n_pairs)
     results_per_layer_exp2 = [[] for _ in range(num_layers)]
     all_target_tokens_exp2 = []
 
