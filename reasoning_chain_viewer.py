@@ -264,7 +264,7 @@ def calculate_perplexity_and_token_probs(prompt, context_chunks, target_chunk):
     probs = torch.nn.functional.softmax(logits_for_targets, dim=-1)
     target_token_ids = labels[0, target_indices]
     actual_token_probs = probs.gather(1, target_token_ids.unsqueeze(1)).squeeze().tolist()
-
+    
     if not isinstance(actual_token_probs, list):
         actual_token_probs = [actual_token_probs]
 
@@ -432,30 +432,30 @@ def build_highlighted_html_from_token_infos(text: str, baseline_infos: list[dict
     base_probs = _build_char_prob_array(length, baseline_infos)
     new_probs = _build_char_prob_array(length, new_infos)
 
-    signed: list[float] = []
+    diffs: list[float] = []
     for i in range(length):
         bp = base_probs[i]
         np = new_probs[i]
         if bp >= 0.0 and np >= 0.0:
-            signed.append(np - bp)
+            diffs.append(abs(np - bp))
         else:
-            signed.append(0.0)
+            diffs.append(0.0)
 
-    max_mag = max((abs(v) for v in signed), default=0.0)
-    if max_mag <= 0:
+    max_diff = max(diffs) if diffs else 0.0
+    # If no difference, just return HTML-escaped original text
+    if max_diff <= 0:
         return f"<div class=\"chunk-text\">{_escape_html(text)}</div>"
 
-    # Quantize magnitudes to reduce span churn
+    # Quantize to reduce span churn
     levels = 12
-    def bucketize_mag(v: float) -> int:
-        m = abs(v)
-        if m <= 0:
+    def bucketize(v: float) -> int:
+        if v <= 0:
             return 0
-        return max(1, min(levels, int(round((m / max_mag) * levels))))
+        return max(1, min(levels, int(round((v / max_diff) * levels))))
 
-    # Alpha mapping tuned for light backgrounds
-    min_alpha = 0.10
-    max_alpha = 0.60
+    # Style alpha mapping for buckets
+    min_alpha = 0.12
+    max_alpha = 0.85
     def alpha_for(bucket: int) -> float:
         if bucket <= 0:
             return 0.0
@@ -474,24 +474,17 @@ def build_highlighted_html_from_token_infos(text: str, baseline_infos: list[dict
         idx = seg_start
         # Accumulate plain text and highlighted runs
         while idx < seg_end:
-            b = bucketize_mag(signed[idx])
-            s = signed[idx]
+            b = bucketize(diffs[idx])
             run_start = idx
             idx += 1
-            while idx < seg_end and bucketize_mag(signed[idx]) == b and (signed[idx] >= 0) == (s >= 0):
+            while idx < seg_end and bucketize(diffs[idx]) == b:
                 idx += 1
             run_text = text[run_start:idx]
             if b == 0:
                 html_parts.append(_escape_html(run_text))
             else:
                 alpha = alpha_for(b)
-                # Positive delta -> greener, Negative -> bluer
-                if s >= 0:
-                    # green
-                    html_parts.append(f"<span class=\"tok-diff\" style=\"background-color: rgba(0, 160, 60, {alpha:.3f});\">{_escape_html(run_text)}</span>")
-                else:
-                    # blue
-                    html_parts.append(f"<span class=\"tok-diff\" style=\"background-color: rgba(40, 100, 240, {alpha:.3f});\">{_escape_html(run_text)}</span>")
+                html_parts.append(f"<span class=\"tok-diff\" style=\"background-color: rgba(255, 80, 0, {alpha:.3f});\">{_escape_html(run_text)}</span>")
 
     html_parts.append("</div>")
     return "".join(html_parts)
@@ -504,9 +497,9 @@ def build_style(min_width_px: int) -> str:
         f"#chunks-container {{ display: block !important; }}\n"
         f"#chunks-container > div {{ overflow-x: auto !important; padding-bottom: 15px; }}\n"
         f"#chunks-row {{ display: inline-flex !important; flex-wrap: nowrap !important; gap: 12px; padding: 5px; }}\n"
-        f".reasoning-chunk {{ min-width: {safe_width}px !important; border: 1px solid #ddd; border-radius: 8px; background-color: #ffffff; padding: 10px; color: #111; }}\n"
-        f".reasoning-chunk > div {{ overflow: visible !important; color: inherit; }}\n"
-        f".reasoning-chunk .chunk-text {{ white-space: pre-wrap; color: inherit; }}\n"
+        f".reasoning-chunk {{ min-width: {safe_width}px !important; border: 1px solid #444; border-radius: 8px; background-color: #1c1c1c; padding: 10px; }}\n"
+        f".reasoning-chunk > div {{ overflow: visible !important; }}\n"
+        f".reasoning-chunk .chunk-text {{ white-space: pre-wrap; }}\n"
         f".reasoning-chunk .tok-diff {{ border-radius: 2px; }}\n"
         f".reasoning-chunk .vega-embed .axis text {{ font-size: 5px !important; }}\n"
         f".reasoning-chunk .vega-embed .axis-title {{ font-size: 8px !important; }}\n"
@@ -662,7 +655,7 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
 
             context_chunks = [chunks[j] for j in range(i) if cb_values[j]]
             new_ppl, new_token_info = calculate_perplexity_and_token_probs(prompt_text, context_chunks, chunk)
-
+            
             # Build highlighted HTML using token span offsets to avoid tokenizing partial strings
             if baseline_info and new_token_info:
                 highlighted_html = build_highlighted_html_from_token_infos(chunk, baseline_info, new_token_info)
