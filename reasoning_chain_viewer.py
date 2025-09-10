@@ -199,6 +199,13 @@ def load_sqlite_rows(db_path: str) -> list[dict]:
 def calculate_perplexity_and_token_probs(prompt, context_chunks, target_chunk):
     """
     Calculates perplexity and returns token-level probabilities for the target chunk.
+
+    Returns:
+        perplexity (float), token_infos (list[dict]) where each dict contains:
+            - token: str               decoded token text
+            - prob: float              probability of the token
+            - start: int               start char (inclusive) in target_chunk
+            - end: int                 end char (exclusive) in target_chunk
     """
     if not MODEL_LOADED or not target_chunk:
         return 0.0, []
@@ -257,14 +264,237 @@ def calculate_perplexity_and_token_probs(prompt, context_chunks, target_chunk):
     probs = torch.nn.functional.softmax(logits_for_targets, dim=-1)
     target_token_ids = labels[0, target_indices]
     actual_token_probs = probs.gather(1, target_token_ids.unsqueeze(1)).squeeze().tolist()
-    
+
     if not isinstance(actual_token_probs, list):
         actual_token_probs = [actual_token_probs]
 
     decoded_tokens = [tokenizer.decode(token_id) for token_id in target_token_ids]
-    token_info = list(zip(decoded_tokens, actual_token_probs))
-    
-    return perplexity, token_info
+
+    token_infos = []
+    # Map token offsets into target_chunk coordinate space
+    for idx_in_seq, token_text, prob in zip(target_indices.tolist(), decoded_tokens, actual_token_probs):
+        start_char, end_char = offset_mapping[idx_in_seq]
+        # Convert from tensors to ints if needed
+        start_char = int(start_char)
+        end_char = int(end_char)
+        if start_char >= target_start_char and end_char <= target_end_char and start_char != end_char:
+            token_infos.append({
+                "token": token_text,
+                "prob": float(prob),
+                "start": start_char - target_start_char,
+                "end": end_char - target_start_char,
+            })
+
+    return perplexity, token_infos
+
+def _is_escaped(text: str, pos: int) -> bool:
+    """Return True if character at pos is escaped by an odd number of backslashes immediately preceding it."""
+    backslashes = 0
+    i = pos - 1
+    while i >= 0 and text[i] == "\\":
+        backslashes += 1
+        i -= 1
+    return (backslashes % 2) == 1
+
+def segment_text_with_latex(text: str) -> list[tuple[int, int, bool]]:
+    """
+    Split text into segments (start, end, is_math) where math segments are delimited by
+    one of: $$...$$, \[...\], \(...\), $...$ (unescaped). No nesting support; segments are greedy.
+    """
+    n = len(text)
+    segments: list[tuple[int, int, bool]] = []
+    pos = 0
+    last_plain = 0
+    in_math = False
+    math_start = 0
+    current_delim = None  # one of "$$", "$", "\\[", "\\("
+
+    while pos < n:
+        if not in_math:
+            if text.startswith("$$", pos):
+                if last_plain < pos:
+                    segments.append((last_plain, pos, False))
+                in_math = True
+                current_delim = "$$"
+                math_start = pos
+                pos += 2
+                continue
+            if text.startswith("\\[", pos):
+                if last_plain < pos:
+                    segments.append((last_plain, pos, False))
+                in_math = True
+                current_delim = "\\["
+                math_start = pos
+                pos += 2
+                continue
+            if text.startswith("\\(", pos):
+                if last_plain < pos:
+                    segments.append((last_plain, pos, False))
+                in_math = True
+                current_delim = "\\("
+                math_start = pos
+                pos += 2
+                continue
+            ch = text[pos]
+            if ch == "$" and not _is_escaped(text, pos):
+                # single dollar
+                if last_plain < pos:
+                    segments.append((last_plain, pos, False))
+                in_math = True
+                current_delim = "$"
+                math_start = pos
+                pos += 1
+                continue
+            pos += 1
+        else:
+            if current_delim == "$$":
+                if text.startswith("$$", pos):
+                    segments.append((math_start, pos + 2, True))
+                    pos += 2
+                    last_plain = pos
+                    in_math = False
+                    current_delim = None
+                    continue
+                pos += 1
+                continue
+            if current_delim == "\\[":
+                if text.startswith("\\]", pos):
+                    segments.append((math_start, pos + 2, True))
+                    pos += 2
+                    last_plain = pos
+                    in_math = False
+                    current_delim = None
+                    continue
+                pos += 1
+                continue
+            if current_delim == "\\(":
+                if text.startswith("\\)", pos):
+                    segments.append((math_start, pos + 2, True))
+                    pos += 2
+                    last_plain = pos
+                    in_math = False
+                    current_delim = None
+                    continue
+                pos += 1
+                continue
+            if current_delim == "$":
+                if text[pos] == "$" and not _is_escaped(text, pos):
+                    segments.append((math_start, pos + 1, True))
+                    pos += 1
+                    last_plain = pos
+                    in_math = False
+                    current_delim = None
+                    continue
+                pos += 1
+                continue
+
+    # Close trailing segment
+    if in_math:
+        segments.append((math_start, n, True))
+        if n > n:  # no-op, structural symmetry
+            pass
+    if last_plain < n:
+        segments.append((last_plain, n, False))
+
+    # Ensure segments are ordered by start
+    segments.sort(key=lambda t: t[0])
+    return segments
+
+def _escape_html(text: str) -> str:
+    return (text
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+def _build_char_prob_array(length: int, token_infos: list[dict]) -> list[float]:
+    arr = [-1.0] * length
+    for info in token_infos or []:
+        start = max(0, int(info.get("start", 0)))
+        end = min(length, int(info.get("end", 0)))
+        if start >= end:
+            continue
+        p = float(info.get("prob", 0.0))
+        for i in range(start, end):
+            arr[i] = p
+    return arr
+
+def build_highlighted_html_from_token_infos(text: str, baseline_infos: list[dict], new_infos: list[dict]) -> str:
+    """Construct HTML with per-character background intensity proportional to |new - baseline|.
+
+    - Uses token offsets (relative to the original `text`) derived from full-template tokenization.
+    - Avoids injecting spans inside LaTeX/math segments to prevent MathJax breakage.
+    """
+    if not text:
+        return ""
+
+    length = len(text)
+    base_probs = _build_char_prob_array(length, baseline_infos)
+    new_probs = _build_char_prob_array(length, new_infos)
+
+    signed: list[float] = []
+    for i in range(length):
+        bp = base_probs[i]
+        np = new_probs[i]
+        if bp >= 0.0 and np >= 0.0:
+            signed.append(np - bp)
+        else:
+            signed.append(0.0)
+
+    max_mag = max((abs(v) for v in signed), default=0.0)
+    if max_mag <= 0:
+        return f"<div class=\"chunk-text\">{_escape_html(text)}</div>"
+
+    # Quantize magnitudes to reduce span churn
+    levels = 12
+    def bucketize_mag(v: float) -> int:
+        m = abs(v)
+        if m <= 0:
+            return 0
+        return max(1, min(levels, int(round((m / max_mag) * levels))))
+
+    # Alpha mapping tuned for light backgrounds
+    min_alpha = 0.10
+    max_alpha = 0.60
+    def alpha_for(bucket: int) -> float:
+        if bucket <= 0:
+            return 0.0
+        return min_alpha + (max_alpha - min_alpha) * (bucket / levels)
+
+    segments = segment_text_with_latex(text)
+    html_parts: list[str] = ["<div class=\"chunk-text\">"]
+
+    for seg_start, seg_end, is_math in segments:
+        segment_text = text[seg_start:seg_end]
+        if is_math:
+            # Leave math untouched
+            html_parts.append(segment_text)
+            continue
+
+        idx = seg_start
+        # Accumulate plain text and highlighted runs
+        while idx < seg_end:
+            b = bucketize_mag(signed[idx])
+            s = signed[idx]
+            run_start = idx
+            idx += 1
+            while idx < seg_end and bucketize_mag(signed[idx]) == b and (signed[idx] >= 0) == (s >= 0):
+                idx += 1
+            run_text = text[run_start:idx]
+            if b == 0:
+                html_parts.append(_escape_html(run_text))
+            else:
+                alpha = alpha_for(b)
+                # Positive delta -> greener, Negative -> bluer
+                if s >= 0:
+                    # green
+                    html_parts.append(f"<span class=\"tok-diff\" style=\"background-color: rgba(0, 160, 60, {alpha:.3f});\">{_escape_html(run_text)}</span>")
+                else:
+                    # blue
+                    html_parts.append(f"<span class=\"tok-diff\" style=\"background-color: rgba(40, 100, 240, {alpha:.3f});\">{_escape_html(run_text)}</span>")
+
+    html_parts.append("</div>")
+    return "".join(html_parts)
 
 def build_style(min_width_px: int) -> str:
     """Return a style tag to control chunk min-width dynamically."""
@@ -274,8 +504,10 @@ def build_style(min_width_px: int) -> str:
         f"#chunks-container {{ display: block !important; }}\n"
         f"#chunks-container > div {{ overflow-x: auto !important; padding-bottom: 15px; }}\n"
         f"#chunks-row {{ display: inline-flex !important; flex-wrap: nowrap !important; gap: 12px; padding: 5px; }}\n"
-        f".reasoning-chunk {{ min-width: {safe_width}px !important; border: 1px solid #444; border-radius: 8px; background-color: #1c1c1c; padding: 10px; }}\n"
-        f".reasoning-chunk > div {{ overflow: visible !important; }}\n"
+        f".reasoning-chunk {{ min-width: {safe_width}px !important; border: 1px solid #ddd; border-radius: 8px; background-color: #ffffff; padding: 10px; color: #111; }}\n"
+        f".reasoning-chunk > div {{ overflow: visible !important; color: inherit; }}\n"
+        f".reasoning-chunk .chunk-text {{ white-space: pre-wrap; color: inherit; }}\n"
+        f".reasoning-chunk .tok-diff {{ border-radius: 2px; }}\n"
         f".reasoning-chunk .vega-embed .axis text {{ font-size: 5px !important; }}\n"
         f".reasoning-chunk .vega-embed .axis-title {{ font-size: 8px !important; }}\n"
         f".reasoning-chunk .vega-embed .legend .label {{ font-size: 8px !important; }}\n"
@@ -399,7 +631,7 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
             updates[chunk_cols[i]] = gr.update(visible=True)
             
             if token_info:
-                df = pd.DataFrame(token_info, columns=["Token", "Probability"])
+                df = pd.DataFrame([(t["token"], t["prob"]) for t in token_info], columns=["Token", "Probability"])
                 df["Index"] = list(range(1, len(df) + 1))
                 updates[chunk_plots[i]] = gr.update(value=df, x="Index", y="Probability", color=None, title=f"Chunk {i+1} Baseline Probs", visible=True, y_lim=[0, 1], tooltip=["Token", "Index"])
             else:
@@ -430,16 +662,23 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
 
             context_chunks = [chunks[j] for j in range(i) if cb_values[j]]
             new_ppl, new_token_info = calculate_perplexity_and_token_probs(prompt_text, context_chunks, chunk)
-            
-            updates[chunk_markdowns[i]] = gr.update(value=f"**Baseline PPL: {baseline_ppl:.2f}**\n**New PPL: {new_ppl:.2f}**\n\n---\n\n{chunk}")
+
+            # Build highlighted HTML using token span offsets to avoid tokenizing partial strings
+            if baseline_info and new_token_info:
+                highlighted_html = build_highlighted_html_from_token_infos(chunk, baseline_info, new_token_info)
+            else:
+                highlighted_html = _escape_html(chunk)
+                highlighted_html = f"<div class=\"chunk-text\">{highlighted_html}</div>"
+
+            updates[chunk_markdowns[i]] = gr.update(value=f"**Baseline PPL: {baseline_ppl:.2f}**\n**New PPL: {new_ppl:.2f}**\n\n---\n\n{highlighted_html}")
             
             if baseline_info and new_token_info:
                 # Build two series with explicit positional index to preserve order per series
-                df_base = pd.DataFrame(baseline_info, columns=["Token", "Probability"])  
+                df_base = pd.DataFrame([(t["token"], t["prob"]) for t in baseline_info], columns=["Token", "Probability"])  
                 df_base["Index"] = list(range(1, len(df_base) + 1))
                 df_base["Series"] = "Baseline"
 
-                df_new = pd.DataFrame(new_token_info, columns=["Token", "Probability"])  
+                df_new = pd.DataFrame([(t["token"], t["prob"]) for t in new_token_info], columns=["Token", "Probability"])  
                 df_new["Index"] = list(range(1, len(df_new) + 1))
                 df_new["Series"] = "New"
 
@@ -447,7 +686,7 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
 
                 updates[chunk_plots[i]] = gr.update(value=df_long, x="Index", y="Probability", visible=True, y_lim=[0, 1], color="Series", title=f"Chunk {i+1} Probability Comparison", tooltip=["Token", "Series", "Index"])
             elif baseline_info: # If new failed, show baseline
-                df = pd.DataFrame(baseline_info, columns=["Token", "Probability"]) 
+                df = pd.DataFrame([(t["token"], t["prob"]) for t in baseline_info], columns=["Token", "Probability"]) 
                 df["Index"] = list(range(1, len(df) + 1))
                 updates[chunk_plots[i]] = gr.update(value=df, x="Index", y="Probability", color=None, title=f"Chunk {i+1} Baseline Probs", visible=True, y_lim=[0, 1], tooltip=["Token", "Index"])
             else:
