@@ -29,7 +29,6 @@ MODEL_LOADED = False
 model = None
 tokenizer = None
 model_error_message = ""
-device = "cuda" if torch.cuda.is_available() else "cpu"
 
 def ensure_model_for_source(source: str):
     global MODEL_NAME, MODEL_LOADED, model, tokenizer
@@ -48,8 +47,8 @@ def ensure_model_for_source(source: str):
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME,
-        device_map=device,
-        torch_dtype=torch.bfloat16 if "cuda" in device else torch.float32
+        device_map="auto",
+        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32
     )
     MODEL_LOADED = True
     logger.info("Model loaded successfully.")
@@ -206,7 +205,7 @@ def load_sqlite_rows(db_path: str) -> list[dict]:
             pass
     return rows
 
-def calculate_perplexity_and_token_probs(prompt, context_chunks, target_chunk):
+def calculate_perplexity_and_token_probs(prompt, context_chunks, target_chunk, system_prompt: str | None = None):
     """
     Calculates perplexity and returns token-level probabilities for the target chunk.
 
@@ -220,7 +219,11 @@ def calculate_perplexity_and_token_probs(prompt, context_chunks, target_chunk):
     if not MODEL_LOADED or not target_chunk:
         return 0.0, []
 
-    messages = [{"role": "user", "content": prompt}]
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    
     if context_chunks:
         messages.extend([{"role": "assistant", "content": chunk} for chunk in context_chunks])
     
@@ -233,7 +236,7 @@ def calculate_perplexity_and_token_probs(prompt, context_chunks, target_chunk):
         templated_string, 
         return_tensors="pt", 
         return_offsets_mapping=True
-    ).to(device)
+    )
     
     input_ids = inputs.input_ids
     offset_mapping = inputs.offset_mapping[0]
@@ -316,14 +319,19 @@ def calculate_perplexity_and_token_probs(prompt, context_chunks, target_chunk):
 
     return perplexity, token_infos
 
-def generate_solution_from_think(prompt_text: str, think_content: str) -> str | None:
+def generate_solution_from_think(prompt_text: str, think_content: str, system_prompt: str | None = None) -> str | None:
     """If model is Qwen3, generate a solution given the thinking so far."""
     if "Qwen3" not in MODEL_NAME or not MODEL_LOADED:
         return None
     
     try:
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt_text})
+        
         header = tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt_text}],
+            messages,
             tokenize=False,
             add_generation_prompt=True,
         )
@@ -331,7 +339,7 @@ def generate_solution_from_think(prompt_text: str, think_content: str) -> str | 
         # The think_content is the reasoning chain up to a certain chunk
         templated = header + f"<think>\n{think_content}{QWEN3_SPECIAL_STOPPING_PROMPT}"
         
-        inputs = tokenizer(templated, return_tensors="pt").to(device)
+        inputs = tokenizer(templated, return_tensors="pt")
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs,
@@ -536,10 +544,10 @@ def build_highlighted_html_from_token_infos(text: str, baseline_infos: list[dict
                     f"Token: '{t}'\n"
                     f"P(token|baseline): {bp_tok_prob:.3f}\n"
                     f"P(token|new): {np_tok_prob:.3f}\n"
+                    f"Δ(prob): {delta:+.3f}"
                     "___________\n\n"
                     f"Baseline argmax: '{bp_argmax_tok}' ({bp_argmax_prob:.3f})\n"
                     f"New argmax: '{np_argmax_tok}' ({np_argmax_prob:.3f})\n"
-                    f"Δ(prob): {delta:+.3f}"
                 )
 
             if current_info_str != last_info_str:
@@ -613,10 +621,10 @@ def build_highlighted_html_from_token_infos(text: str, baseline_infos: list[dict
                     f"Token: '{t}'\n"
                     f"P(token|baseline): {bp_tok_prob:.3f}\n"
                     f"P(token|new): {np_tok_prob:.3f}\n"
+                    f"Δ(prob): {delta:+.3f}"
                     "___________\n\n"
                     f"Baseline argmax: '{bp_argmax_tok}' ({bp_argmax_prob:.3f})\n"
                     f"New argmax: '{np_argmax_tok}' ({np_argmax_prob:.3f})\n"
-                    f"Δ(prob): {delta:+.3f}"
                 )
 
             current_bucket = bucketize(diffs[idx])
@@ -682,16 +690,33 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
     # Source control states
     source_state = gr.State(INITIAL_SOURCE)
     sql_rows_state = gr.State(default_sql_rows)
+    baseline_solutions_state = gr.State([])
 
     with gr.Row():
         source_selector = gr.Dropdown(choices=["dataset", "sqlite"], value=INITIAL_SOURCE, label="Source")
+        index_input = gr.Number(value=0, step=1, label="Index", precision=0)
+        recalc_button = gr.Button("Recalculate Perplexity", variant="primary")
+    
+    with gr.Row():
+        baseline_system_prompt_input = gr.Textbox(
+            label="Baseline System Prompt (for initial Forced Solution)", 
+            lines=3, 
+            placeholder="System prompt for the 'Baseline Forced Solution'. PPL calculation ignores this.",
+            value="Answer only with a letter of a correct choice."
+        )
+        recalc_system_prompt_input = gr.Textbox(
+            label="Recalculate System Prompt (for New PPL & Solution)", 
+            lines=3, 
+            placeholder="System prompt for 'New PPL' and 'New Forced Solution'.",
+            value="Answer only with a letter of a correct choice."
+        )
+
+    use_baseline_prompt_for_ppl_cb = gr.Checkbox(
+        label="Use Baseline System Prompt for Baseline PPL Calculation",
+        value=True
+    )
 
     source_info_md = gr.Markdown(value=(f"Using dataset. Available: {len(dataset['train']) if DATASET_LOADED else 0}" if INITIAL_SOURCE == "dataset" else f"Using SQLite. Loaded rows: {len(default_sql_rows)}"))
-
-    with gr.Row():
-        index_input = gr.Number(value=0, step=1, label="Index", precision=0)
-        chunk_min_width = gr.Number(value=380, step=10, label="Chunk min width (px)", precision=0)
-        recalc_button = gr.Button("Recalculate Perplexity", variant="primary")
 
     latex_delimiters_config = [{"left": "$$", "right": "$$", "display": True}, {"left": "$", "right": "$", "display": False}, {"left": r"\(", "right": r"\)", "display": False}, {"left": r"\[", "right": r"\]", "display": True}]
     prompt_output = gr.Markdown(latex_delimiters=latex_delimiters_config)
@@ -715,14 +740,14 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
     composed_text_tb = gr.Textbox(label="Composed Reasoning (editable)", lines=12)
     generate_button = gr.Button("Generate", variant="primary")
 
-    baseline_outputs = [style_injector, prompt_output, ground_truth_output, chunks_state, baseline_ppls_state, baseline_token_probs_state, prompt_state]
+    baseline_outputs = [style_injector, prompt_output, ground_truth_output, chunks_state, baseline_ppls_state, baseline_token_probs_state, baseline_solutions_state, prompt_state]
     baseline_outputs.extend(chunk_cols)
     baseline_outputs.extend(chunk_checkboxes)
     baseline_outputs.extend(chunk_markdowns)
     baseline_outputs.extend(chunk_plots)
     baseline_outputs.append(composed_text_tb)
 
-    def get_baseline_final(index_str, min_chunk_width, current_source, sql_rows):
+    def get_baseline_final(index_str, current_source, sql_rows, baseline_system_prompt, use_baseline_prompt_for_ppl):
         # Ensure correct model/tokenizer for current source
         ensure_model_for_source(current_source)
         try:
@@ -769,7 +794,7 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
             return updates
 
         updates = {
-            style_injector: gr.update(value=build_style(int(min_chunk_width))),
+            style_injector: gr.update(value=build_style(380)), # Hardcoded width for now
             prompt_output: gr.update(value=f"## Prompt\n\n{prompt}", visible=True),
             ground_truth_output: gr.update(value=f"## Ground Truth\n\n{ground_truth_value}", visible=True),
             chunks_state: chunks,
@@ -778,21 +803,30 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
 
         baseline_perplexities = []
         baseline_token_probs = []
+        baseline_solutions = []
         
+        system_prompt_for_baseline_ppl = baseline_system_prompt if use_baseline_prompt_for_ppl else None
+
         logger.info("Calculating baseline perplexities and token probabilities...")
         for i in tqdm(range(len(chunks)), desc="Baseline PPL & Probs"):
             chunk = chunks[i]
-            ppl, token_info = calculate_perplexity_and_token_probs(prompt, chunks[:i], chunk)
+            # Baseline is calculated WITH or WITHOUT the system prompt based on the checkbox.
+            ppl, token_info = calculate_perplexity_and_token_probs(prompt, chunks[:i], chunk, system_prompt=system_prompt_for_baseline_ppl)
             baseline_perplexities.append(ppl)
             baseline_token_probs.append(token_info)
 
             md_text = f"**Baseline PPL: {ppl:.2f}**"
+            generated_solution_text = ""
             if "Qwen3" in MODEL_NAME:
                 solution_context = "\n\n".join(chunks[:i+1])
-                generated_solution = generate_solution_from_think(prompt, solution_context)
+                generated_solution = generate_solution_from_think(prompt, solution_context, baseline_system_prompt)
+                generated_solution_text = generated_solution or ""
                 if generated_solution:
-                    blockquote_solution = "> " + generated_solution.replace("\n", "\n> ")
-                    md_text += f"\n\n**Forced Solution:**\n\n{blockquote_solution}"
+                    escaped_solution = _escape_html(generated_solution).replace("\n", "<br>")
+                    blockquote_html = f"<blockquote>{escaped_solution}</blockquote>"
+                    md_text += f"\n\n**Baseline Forced Solution:**\n\n{blockquote_html}"
+            
+            baseline_solutions.append(generated_solution_text)
 
             md_text += f"\n\n---\n\n{chunk}"
             updates[chunk_markdowns[i]] = gr.update(value=md_text)
@@ -812,6 +846,7 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
 
         updates[baseline_ppls_state] = baseline_perplexities
         updates[baseline_token_probs_state] = baseline_token_probs
+        updates[baseline_solutions_state] = baseline_solutions
 
         # Initialize composed text with all chunks enabled
         composed_initial = "\n\n".join(chunks)
@@ -823,7 +858,7 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
         logger.info("Done.")
         return updates
 
-    def recalculate_perplexities(prompt_text, chunks, baseline_ppls, baseline_token_probs, *cb_values):
+    def recalculate_perplexities(prompt_text, chunks, baseline_ppls, baseline_token_probs, baseline_solutions, recalc_system_prompt, *cb_values):
         if not chunks: return {}
         logger.info("Recalculating...")
         updates = {}
@@ -838,7 +873,7 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
                 continue
 
             context_chunks = [chunks[j] for j in range(i) if cb_values[j]]
-            new_ppl, new_token_info = calculate_perplexity_and_token_probs(prompt_text, context_chunks, chunk)
+            new_ppl, new_token_info = calculate_perplexity_and_token_probs(prompt_text, context_chunks, chunk, recalc_system_prompt)
             
             # Build highlighted HTML using token span offsets to avoid tokenizing partial strings
             if baseline_info and new_token_info:
@@ -848,13 +883,23 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
                 highlighted_html = f"<div class=\"chunk-text\">{highlighted_html}</div>"
 
             md_text = f"**Baseline PPL: {baseline_ppl:.2f}**\n**New PPL: {new_ppl:.2f}**"
+
+            # Display baseline solution retrieved from state
+            if i < len(baseline_solutions) and baseline_solutions[i]:
+                baseline_solution = baseline_solutions[i]
+                escaped_solution = _escape_html(baseline_solution).replace("\n", "<br>")
+                blockquote_html = f"<blockquote>{escaped_solution}</blockquote>"
+                md_text += f"\n\n**Baseline Forced Solution:**\n\n{blockquote_html}"
+
+            # Generate and display new solution
             if "Qwen3" in MODEL_NAME:
                 current_and_context_chunks = context_chunks + [chunk]
                 solution_context = "\n\n".join(current_and_context_chunks)
-                generated_solution = generate_solution_from_think(prompt_text, solution_context)
+                generated_solution = generate_solution_from_think(prompt_text, solution_context, recalc_system_prompt)
                 if generated_solution:
-                    blockquote_solution = "> " + generated_solution.replace("\n", "\n> ")
-                    md_text += f"\n\n**Forced Solution:**\n\n{blockquote_solution}"
+                    escaped_solution = _escape_html(generated_solution).replace("\n", "<br>")
+                    blockquote_html = f"<blockquote>{escaped_solution}</blockquote>"
+                    md_text += f"\n\n**New Forced Solution:**\n\n{blockquote_html}"
 
             md_text += f"\n\n---\n\n{highlighted_html}"
             updates[chunk_markdowns[i]] = gr.update(value=md_text)
@@ -893,25 +938,25 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
 
     index_input.change(
         get_baseline_final,
-        inputs=[index_input, chunk_min_width, source_state, sql_rows_state],
-        outputs=list(recalc_outputs.values()) + baseline_outputs  # A bit of a hack to get all components
+        inputs=[index_input, source_state, sql_rows_state, baseline_system_prompt_input, use_baseline_prompt_for_ppl_cb],
+        outputs=list(recalc_outputs.values()) + baseline_outputs
     ).then(
         None, # This is a placeholder for the component dict wiring
         inputs=None, outputs=None, js="() => { console.log('Update dictionary wiring is complex, returning full list.'); }"
     )
 
-    def recalculate_perplexities_with_source(current_source, prompt_text, chunks, baseline_ppls, baseline_token_probs, *cb_values):
+    def recalculate_perplexities_with_source(current_source, prompt_text, chunks, baseline_ppls, baseline_token_probs, baseline_solutions, recalc_system_prompt, *cb_values):
         ensure_model_for_source(current_source)
-        return recalculate_perplexities(prompt_text, chunks, baseline_ppls, baseline_token_probs, *cb_values)
+        return recalculate_perplexities(prompt_text, chunks, baseline_ppls, baseline_token_probs, baseline_solutions, recalc_system_prompt, *cb_values)
 
     recalc_button.click(
         recalculate_perplexities_with_source,
-        inputs=[source_state, prompt_state, chunks_state, baseline_ppls_state, baseline_token_probs_state, *chunk_checkboxes],
+        inputs=[source_state, prompt_state, chunks_state, baseline_ppls_state, baseline_token_probs_state, baseline_solutions_state, recalc_system_prompt_input, *chunk_checkboxes],
         outputs=list(recalc_outputs.keys()) + [composed_text_tb]
     )
 
     # --- Generation of continuation ---
-    def generate_continuation(current_source, prompt_text, composed_text):
+    def generate_continuation(current_source, prompt_text, composed_text, system_prompt: str | None = None):
         """Generate 50-token continuation for composed_text with hidden user prompt and <think> context."""
         ensure_model_for_source(current_source)
         if not prompt_text:
@@ -920,8 +965,12 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
         try:
             # Manually construct prompt for continuation based on tokenizer_test.ipynb.
             # Using apply_chat_template with a partial assistant message is unreliable.
+            messages = []
+            if system_prompt:
+                messages.append({"role": "system", "content": system_prompt})
+            messages.append({"role": "user", "content": prompt_text})
             header = tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt_text}],
+                messages,
                 tokenize=False,
                 add_generation_prompt=True,
             )
@@ -934,7 +983,7 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
             inputs = tokenizer(
                 templated,
                 return_tensors="pt",
-            ).to(device)
+            )
             with torch.no_grad():
                 output_ids = model.generate(
                     **inputs,
@@ -951,13 +1000,13 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
             logger.error(f"Generation failed: {e}")
             return base_text
 
-    def on_generate(current_source, prompt_text, composed_text):
-        new_text = generate_continuation(current_source, prompt_text, composed_text)
+    def on_generate(current_source, prompt_text, composed_text, system_prompt):
+        new_text = generate_continuation(current_source, prompt_text, composed_text, system_prompt)
         return gr.update(value=new_text)
 
     generate_button.click(
         on_generate,
-        inputs=[source_state, prompt_state, composed_text_tb],
+        inputs=[source_state, prompt_state, composed_text_tb, recalc_system_prompt_input],
         outputs=[composed_text_tb],
     )
 
@@ -995,7 +1044,7 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
 
     demo.load(
         get_baseline_final,
-        inputs=[index_input, chunk_min_width, source_state, sql_rows_state],
+        inputs=[index_input, source_state, sql_rows_state, baseline_system_prompt_input, use_baseline_prompt_for_ppl_cb],
         outputs=list(recalc_outputs.values()) + baseline_outputs
     )
 
