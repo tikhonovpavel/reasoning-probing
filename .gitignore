@@ -11,5 +11,5 @@ probe-visualizer/
 related_papers/
 unembedding_cache/
 temp.csv
-reasoning_traces.sqlite
+# reasoning_traces.sqlite
 venv/
