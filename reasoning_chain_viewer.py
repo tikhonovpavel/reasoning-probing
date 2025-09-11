@@ -16,11 +16,13 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- Configuration ---
-MAX_CHUNKS = 30
+MAX_CHUNKS = 20
 MODEL_NAME = "Qwen/QwQ-32B"
 OVERRIDE_MODEL_NAME: str | None = None
 INITIAL_SOURCE: str = "dataset"
 SQLITE_DB_PATH: str = "reasoning_traces.sqlite"
+
+QWEN3_SPECIAL_STOPPING_PROMPT = "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>"
 
 # --- Model Loading ---
 MODEL_LOADED = False
@@ -55,8 +57,8 @@ def ensure_model_for_source(source: str):
 # Parse CLI args early to decide initial source/model before loading anything heavy
 try:
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--initial-source", choices=["dataset", "sqlite"], default="dataset")
-    parser.add_argument("--model-name", type=str, default=None)
+    parser.add_argument("--initial-source", choices=["dataset", "sqlite"], default="sqlite")
+    parser.add_argument("--model-name", type=str, default='Qwen/Qwen3-0.6B')
     parser.add_argument("--sqlite-db", type=str, default=SQLITE_DB_PATH)
     args, _unknown = parser.parse_known_args()
     INITIAL_SOURCE = args.initial_source
@@ -103,6 +105,14 @@ def split_reasoning_chain(reasoning_chain: str) -> list[str]:
     if current_chunk_paragraphs:
         final_chunks.append("\n\n".join(current_chunk_paragraphs).strip())
     return [chunk for chunk in final_chunks if chunk]
+
+def count_sentences_simple(text: str) -> int:
+    """A simple sentence counter based on splitting by '. '."""
+    if not text:
+        return 0
+    normalized_text = text.replace('.\n', '. ').strip()
+    sentences = [s for s in normalized_text.split('. ') if s]
+    return len(sentences)
 
 def extract_think_content(full_prompt_text: str) -> str | None:
     """Return inner text strictly inside <think>...</think> if present; else None.
@@ -262,17 +272,34 @@ def calculate_perplexity_and_token_probs(prompt, context_chunks, target_chunk):
 
     logits_for_targets = logits[0, pred_indices]
     probs = torch.nn.functional.softmax(logits_for_targets, dim=-1)
+    
+    # Probabilities of actual tokens
     target_token_ids = labels[0, target_indices]
     actual_token_probs = probs.gather(1, target_token_ids.unsqueeze(1)).squeeze().tolist()
     
+    # Argmax token probabilities
+    top_token_probs, top_token_ids = torch.max(probs, dim=-1)
+    top_token_probs = top_token_probs.tolist()
+    decoded_top_tokens = [tokenizer.decode(token_id) for token_id in top_token_ids]
+    
     if not isinstance(actual_token_probs, list):
         actual_token_probs = [actual_token_probs]
+    if not isinstance(top_token_probs, list):
+        top_token_probs = [top_token_probs]
+
 
     decoded_tokens = [tokenizer.decode(token_id) for token_id in target_token_ids]
 
     token_infos = []
     # Map token offsets into target_chunk coordinate space
-    for idx_in_seq, token_text, prob in zip(target_indices.tolist(), decoded_tokens, actual_token_probs):
+    zipped_data = zip(
+        target_indices.tolist(), 
+        decoded_tokens, 
+        actual_token_probs, 
+        decoded_top_tokens,
+        top_token_probs
+    )
+    for idx_in_seq, token_text, prob, top_token, top_prob in zipped_data:
         start_char, end_char = offset_mapping[idx_in_seq]
         # Convert from tensors to ints if needed
         start_char = int(start_char)
@@ -283,9 +310,43 @@ def calculate_perplexity_and_token_probs(prompt, context_chunks, target_chunk):
                 "prob": float(prob),
                 "start": start_char - target_start_char,
                 "end": end_char - target_start_char,
+                "top_token": top_token,
+                "top_token_prob": float(top_prob),
             })
 
     return perplexity, token_infos
+
+def generate_solution_from_think(prompt_text: str, think_content: str) -> str | None:
+    """If model is Qwen3, generate a solution given the thinking so far."""
+    if "Qwen3" not in MODEL_NAME or not MODEL_LOADED:
+        return None
+    
+    try:
+        header = tokenizer.apply_chat_template(
+            [{"role": "user", "content": prompt_text}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        
+        # The think_content is the reasoning chain up to a certain chunk
+        templated = header + f"<think>\n{think_content}{QWEN3_SPECIAL_STOPPING_PROMPT}"
+        
+        inputs = tokenizer(templated, return_tensors="pt").to(device)
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=50,
+                do_sample=False, # Be deterministic for the analysis
+                temperature=1.0, # Not used if do_sample=False
+                top_p=1.0,       # Not used if do_sample=False
+            )
+        prompt_len = inputs["input_ids"].shape[1]
+        new_ids = output_ids[0, prompt_len:]
+        continuation = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+        return continuation
+    except Exception as e:
+        logger.error(f"Solution generation failed: {e}")
+        return None
 
 def _is_escaped(text: str, pos: int) -> bool:
     """Return True if character at pos is escaped by an odd number of backslashes immediately preceding it."""
@@ -407,21 +468,30 @@ def _escape_html(text: str) -> str:
             .replace(">", "&gt;")
             .replace('"', "&quot;"))
 
-def _build_char_prob_array(length: int, token_infos: list[dict]) -> list[float]:
-    arr = [-1.0] * length
-    for info in token_infos or []:
+def _build_char_info_array(length: int, token_infos: list[dict] | None) -> list[dict | None]:
+    """Build a per-character array containing token metadata for tooltip generation."""
+    arr: list[dict | None] = [None] * length
+    if not token_infos:
+        return arr
+    for info in token_infos:
         start = max(0, int(info.get("start", 0)))
         end = min(length, int(info.get("end", 0)))
         if start >= end:
             continue
-        p = float(info.get("prob", 0.0))
+        # This data is replicated for each character belonging to the token.
+        char_data = {
+            "token": info.get("token", ""),
+            "prob": info.get("prob", 0.0),
+            "top_token": info.get("top_token", ""),
+            "top_token_prob": info.get("top_token_prob", 0.0),
+        }
         for i in range(start, end):
-            arr[i] = p
+            arr[i] = char_data
     return arr
 
 def build_highlighted_html_from_token_infos(text: str, baseline_infos: list[dict], new_infos: list[dict]) -> str:
-    """Construct HTML with per-character background intensity proportional to |new - baseline|.
-
+    """Construct HTML with per-character background and tooltips.
+    
     - Uses token offsets (relative to the original `text`) derived from full-template tokenization.
     - Avoids injecting spans inside LaTeX/math segments to prevent MathJax breakage.
     """
@@ -429,22 +499,72 @@ def build_highlighted_html_from_token_infos(text: str, baseline_infos: list[dict
         return ""
 
     length = len(text)
-    base_probs = _build_char_prob_array(length, baseline_infos)
-    new_probs = _build_char_prob_array(length, new_infos)
+    baseline_char_infos = _build_char_info_array(length, baseline_infos)
+    new_char_infos = _build_char_info_array(length, new_infos)
 
     diffs: list[float] = []
     for i in range(length):
-        bp = base_probs[i]
-        np = new_probs[i]
-        if bp >= 0.0 and np >= 0.0:
-            diffs.append(abs(np - bp))
+        b_info = baseline_char_infos[i]
+        n_info = new_char_infos[i]
+        if b_info and n_info:
+            diffs.append(abs(n_info["prob"] - b_info["prob"]))
         else:
             diffs.append(0.0)
 
     max_diff = max(diffs) if diffs else 0.0
-    # If no difference, just return HTML-escaped original text
-    if max_diff <= 0:
-        return f"<div class=\"chunk-text\">{_escape_html(text)}</div>"
+    # If no difference, just return HTML-escaped original text with tooltips
+    if max_diff <= 1e-6: # Use a small epsilon
+        html_parts: list[str] = ["<div class=\"chunk-text\">"]
+        last_info_str = None
+        run_start = 0
+        for i in range(length):
+            b_info = baseline_char_infos[i]
+            n_info = new_char_infos[i]
+            current_info_str = ""
+            if b_info and n_info:
+                # Deliberately verbose for clarity
+                t = b_info['token']
+                bp_argmax_tok = b_info['top_token']
+                bp_argmax_prob = b_info['top_token_prob']
+                np_argmax_tok = n_info['top_token']
+                np_argmax_prob = n_info['top_token_prob']
+                bp_tok_prob = b_info['prob']
+                np_tok_prob = n_info['prob']
+                delta = np_tok_prob - bp_tok_prob
+                
+                current_info_str = (
+                    f"Token: '{t}'\n"
+                    f"P(token|baseline): {bp_tok_prob:.3f}\n"
+                    f"P(token|new): {np_tok_prob:.3f}\n"
+                    "___________\n\n"
+                    f"Baseline argmax: '{bp_argmax_tok}' ({bp_argmax_prob:.3f})\n"
+                    f"New argmax: '{np_argmax_tok}' ({np_argmax_prob:.3f})\n"
+                    f"Δ(prob): {delta:+.3f}"
+                )
+
+            if current_info_str != last_info_str:
+                if i > run_start:
+                    segment = text[run_start:i]
+                    if last_info_str:
+                        escaped_tooltip = _escape_html(last_info_str).replace("\n", "&#10;")
+                        html_parts.append(f"<span title=\"{escaped_tooltip}\">{_escape_html(segment)}</span>")
+                    else:
+                        html_parts.append(_escape_html(segment))
+                run_start = i
+                last_info_str = current_info_str
+
+        # Append final segment
+        if run_start < length:
+            segment = text[run_start:length]
+            if last_info_str:
+                escaped_tooltip = _escape_html(last_info_str).replace("\n", "&#10;")
+                html_parts.append(f"<span title=\"{escaped_tooltip}\">{_escape_html(segment)}</span>")
+            else:
+                html_parts.append(_escape_html(segment))
+        
+        html_parts.append("</div>")
+        return "".join(html_parts)
+
 
     # Quantize to reduce span churn
     levels = 12
@@ -471,20 +591,60 @@ def build_highlighted_html_from_token_infos(text: str, baseline_infos: list[dict
             html_parts.append(segment_text)
             continue
 
+        # Process non-math segments for highlighting and tooltips
         idx = seg_start
-        # Accumulate plain text and highlighted runs
         while idx < seg_end:
-            b = bucketize(diffs[idx])
+            b_info = baseline_char_infos[idx]
+            n_info = new_char_infos[idx]
+            
+            # Form tooltip string for current position
+            tooltip_str = ""
+            if b_info and n_info:
+                t = b_info['token']
+                bp_argmax_tok = b_info['top_token']
+                bp_argmax_prob = b_info['top_token_prob']
+                np_argmax_tok = n_info['top_token']
+                np_argmax_prob = n_info['top_token_prob']
+                bp_tok_prob = b_info['prob']
+                np_tok_prob = n_info['prob']
+                delta = np_tok_prob - bp_tok_prob
+                
+                tooltip_str = (
+                    f"Token: '{t}'\n"
+                    f"P(token|baseline): {bp_tok_prob:.3f}\n"
+                    f"P(token|new): {np_tok_prob:.3f}\n"
+                    "___________\n\n"
+                    f"Baseline argmax: '{bp_argmax_tok}' ({bp_argmax_prob:.3f})\n"
+                    f"New argmax: '{np_argmax_tok}' ({np_argmax_prob:.3f})\n"
+                    f"Δ(prob): {delta:+.3f}"
+                )
+
+            current_bucket = bucketize(diffs[idx])
+            
             run_start = idx
             idx += 1
-            while idx < seg_end and bucketize(diffs[idx]) == b:
+            # Greedily extend run with same bucket and tooltip
+            while (idx < seg_end and 
+                   bucketize(diffs[idx]) == current_bucket and
+                   baseline_char_infos[idx] == b_info): # Pointer comparison is fine for this dict
                 idx += 1
+            
             run_text = text[run_start:idx]
-            if b == 0:
-                html_parts.append(_escape_html(run_text))
+            escaped_run_text = _escape_html(run_text)
+            escaped_tooltip = _escape_html(tooltip_str).replace("\n", "&#10;")
+
+            if current_bucket == 0:
+                if tooltip_str:
+                    html_parts.append(f"<span title=\"{escaped_tooltip}\">{escaped_run_text}</span>")
+                else:
+                    html_parts.append(escaped_run_text)
             else:
-                alpha = alpha_for(b)
-                html_parts.append(f"<span class=\"tok-diff\" style=\"background-color: rgba(255, 80, 0, {alpha:.3f});\">{_escape_html(run_text)}</span>")
+                alpha = alpha_for(current_bucket)
+                style = f"background-color: rgba(255, 80, 0, {alpha:.3f});"
+                if tooltip_str:
+                    html_parts.append(f"<span class=\"tok-diff\" style=\"{style}\" title=\"{escaped_tooltip}\">{escaped_run_text}</span>")
+                else:
+                    html_parts.append(f"<span class=\"tok-diff\" style=\"{style}\">{escaped_run_text}</span>")
 
     html_parts.append("</div>")
     return "".join(html_parts)
@@ -497,7 +657,7 @@ def build_style(min_width_px: int) -> str:
         f"#chunks-container {{ display: block !important; }}\n"
         f"#chunks-container > div {{ overflow-x: auto !important; padding-bottom: 15px; }}\n"
         f"#chunks-row {{ display: inline-flex !important; flex-wrap: nowrap !important; gap: 12px; padding: 5px; }}\n"
-        f".reasoning-chunk {{ min-width: {safe_width}px !important; border: 1px solid #444; border-radius: 8px; background-color: #1c1c1c; padding: 10px; }}\n"
+        f".reasoning-chunk {{ min-width: {safe_width}px !important; border: 1px solid #e0e0e0; border-radius: 8px; background-color: #f9f9f9; padding: 10px; color: #333; }}\n"
         f".reasoning-chunk > div {{ overflow: visible !important; }}\n"
         f".reasoning-chunk .chunk-text {{ white-space: pre-wrap; }}\n"
         f".reasoning-chunk .tok-diff {{ border-radius: 2px; }}\n"
@@ -551,11 +711,16 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
                     chunk_markdowns.append(md)
                     chunk_plots.append(plot)
 
+    gr.Markdown("## Compose & Generate")
+    composed_text_tb = gr.Textbox(label="Composed Reasoning (editable)", lines=12)
+    generate_button = gr.Button("Generate", variant="primary")
+
     baseline_outputs = [style_injector, prompt_output, ground_truth_output, chunks_state, baseline_ppls_state, baseline_token_probs_state, prompt_state]
     baseline_outputs.extend(chunk_cols)
     baseline_outputs.extend(chunk_checkboxes)
     baseline_outputs.extend(chunk_markdowns)
     baseline_outputs.extend(chunk_plots)
+    baseline_outputs.append(composed_text_tb)
 
     def get_baseline_final(index_str, min_chunk_width, current_source, sql_rows):
         # Ensure correct model/tokenizer for current source
@@ -579,7 +744,8 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
                 updates[chunk_cols[i]] = gr.update(visible=False)
                 updates[chunk_markdowns[i]] = gr.update(value="")
                 updates[chunk_plots[i]] = gr.update(visible=False, value=None)
-                updates[chunk_checkboxes[i]] = gr.update(visible=False, value=True)
+                updates[chunk_checkboxes[i]] = gr.update(visible=False, value=True, label=f"Use Chunk {i+1}")
+            updates[composed_text_tb] = gr.update(value="")
             return updates
 
         prompt = item['prompt']
@@ -598,7 +764,8 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
                 updates[chunk_cols[i]] = gr.update(visible=False)
                 updates[chunk_markdowns[i]] = gr.update(value="")
                 updates[chunk_plots[i]] = gr.update(visible=False, value=None)
-                updates[chunk_checkboxes[i]] = gr.update(visible=False, value=True)
+                updates[chunk_checkboxes[i]] = gr.update(visible=False, value=True, label=f"Use Chunk {i+1}")
+            updates[composed_text_tb] = gr.update(value="")
             return updates
 
         updates = {
@@ -619,8 +786,21 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
             baseline_perplexities.append(ppl)
             baseline_token_probs.append(token_info)
 
-            updates[chunk_markdowns[i]] = gr.update(value=f"**Baseline PPL: {ppl:.2f}**\n\n---\n\n{chunk}")
-            updates[chunk_checkboxes[i]] = gr.update(visible=True, value=True)
+            md_text = f"**Baseline PPL: {ppl:.2f}**"
+            if "Qwen3" in MODEL_NAME:
+                solution_context = "\n\n".join(chunks[:i+1])
+                generated_solution = generate_solution_from_think(prompt, solution_context)
+                if generated_solution:
+                    blockquote_solution = "> " + generated_solution.replace("\n", "\n> ")
+                    md_text += f"\n\n**Forced Solution:**\n\n{blockquote_solution}"
+
+            md_text += f"\n\n---\n\n{chunk}"
+            updates[chunk_markdowns[i]] = gr.update(value=md_text)
+            
+            num_sentences = count_sentences_simple(chunk)
+            checkbox_label = f"Use Chunk {i+1} ({num_sentences} sentences)"
+            updates[chunk_checkboxes[i]] = gr.update(visible=True, value=True, label=checkbox_label)
+
             updates[chunk_cols[i]] = gr.update(visible=True)
             
             if token_info:
@@ -632,6 +812,10 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
 
         updates[baseline_ppls_state] = baseline_perplexities
         updates[baseline_token_probs_state] = baseline_token_probs
+
+        # Initialize composed text with all chunks enabled
+        composed_initial = "\n\n".join(chunks)
+        updates[composed_text_tb] = gr.update(value=composed_initial)
 
         for i in range(len(chunks), MAX_CHUNKS):
             updates[chunk_cols[i]] = gr.update(visible=False)
@@ -663,7 +847,17 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
                 highlighted_html = _escape_html(chunk)
                 highlighted_html = f"<div class=\"chunk-text\">{highlighted_html}</div>"
 
-            updates[chunk_markdowns[i]] = gr.update(value=f"**Baseline PPL: {baseline_ppl:.2f}**\n**New PPL: {new_ppl:.2f}**\n\n---\n\n{highlighted_html}")
+            md_text = f"**Baseline PPL: {baseline_ppl:.2f}**\n**New PPL: {new_ppl:.2f}**"
+            if "Qwen3" in MODEL_NAME:
+                current_and_context_chunks = context_chunks + [chunk]
+                solution_context = "\n\n".join(current_and_context_chunks)
+                generated_solution = generate_solution_from_think(prompt_text, solution_context)
+                if generated_solution:
+                    blockquote_solution = "> " + generated_solution.replace("\n", "\n> ")
+                    md_text += f"\n\n**Forced Solution:**\n\n{blockquote_solution}"
+
+            md_text += f"\n\n---\n\n{highlighted_html}"
+            updates[chunk_markdowns[i]] = gr.update(value=md_text)
             
             if baseline_info and new_token_info:
                 # Build two series with explicit positional index to preserve order per series
@@ -686,6 +880,12 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
                 updates[chunk_plots[i]] = gr.update(visible=False, value=None)
 
         logger.info("Done.")
+        # Update composed text based on enabled chunks
+        try:
+            enabled_chunks = [chunks[i] for i in range(len(chunks)) if cb_values[i]]
+        except Exception:
+            enabled_chunks = chunks
+        updates[composed_text_tb] = gr.update(value="\n\n".join(enabled_chunks))
         return updates
 
     # Gradio changed its API, now we can return dicts if outputs are named. Let's name them.
@@ -707,8 +907,76 @@ with gr.Blocks(css="#chunks-container > div { overflow-x: auto !important; paddi
     recalc_button.click(
         recalculate_perplexities_with_source,
         inputs=[source_state, prompt_state, chunks_state, baseline_ppls_state, baseline_token_probs_state, *chunk_checkboxes],
-        outputs=list(recalc_outputs.keys())
+        outputs=list(recalc_outputs.keys()) + [composed_text_tb]
     )
+
+    # --- Generation of continuation ---
+    def generate_continuation(current_source, prompt_text, composed_text):
+        """Generate 50-token continuation for composed_text with hidden user prompt and <think> context."""
+        ensure_model_for_source(current_source)
+        if not prompt_text:
+            return composed_text or ""
+        base_text = composed_text or ""
+        try:
+            # Manually construct prompt for continuation based on tokenizer_test.ipynb.
+            # Using apply_chat_template with a partial assistant message is unreliable.
+            header = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt_text}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+ 
+            if "Qwen3" in MODEL_NAME:
+                templated = header + f"<think>\n{base_text}"
+            else: # For QwQ models which do not use <think>
+                templated = header + base_text
+ 
+            inputs = tokenizer(
+                templated,
+                return_tensors="pt",
+            ).to(device)
+            with torch.no_grad():
+                output_ids = model.generate(
+                    **inputs,
+                    max_new_tokens=50,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.95,
+                )
+            prompt_len = inputs["input_ids"].shape[1]
+            new_ids = output_ids[0, prompt_len:]
+            continuation = tokenizer.decode(new_ids, skip_special_tokens=True)
+            return (base_text + continuation)
+        except Exception as e:
+            logger.error(f"Generation failed: {e}")
+            return base_text
+
+    def on_generate(current_source, prompt_text, composed_text):
+        new_text = generate_continuation(current_source, prompt_text, composed_text)
+        return gr.update(value=new_text)
+
+    generate_button.click(
+        on_generate,
+        inputs=[source_state, prompt_state, composed_text_tb],
+        outputs=[composed_text_tb],
+    )
+
+    # Live recomposition when toggling chunk checkboxes
+    def update_composed_from_cbs(chunks, *cb_values):
+        if not chunks:
+            return ""
+        try:
+            enabled_chunks = [chunks[i] for i in range(min(len(chunks), len(cb_values))) if cb_values[i]]
+        except Exception:
+            enabled_chunks = chunks
+        return "\n\n".join(enabled_chunks)
+
+    for _cb in chunk_checkboxes:
+        _cb.change(
+            update_composed_from_cbs,
+            inputs=[chunks_state, *chunk_checkboxes],
+            outputs=[composed_text_tb],
+        )
 
     # Source controls callbacks
     def set_source(src, current_rows):
