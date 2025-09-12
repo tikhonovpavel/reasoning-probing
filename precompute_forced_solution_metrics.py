@@ -5,7 +5,7 @@ import sqlite3
 import sys
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Iterable, List, Optional
+from typing import Iterable, List, Optional, Dict, Tuple
 
 import torch
 from tqdm.auto import tqdm
@@ -60,6 +60,7 @@ def ensure_metrics_table(conn: sqlite3.Connection):
             predictions_json TEXT NOT NULL,
             continuation_texts_json TEXT NOT NULL DEFAULT '[]',
             token_confidences_json TEXT NOT NULL DEFAULT '[]',
+            letter_probs_json TEXT NOT NULL DEFAULT '[]',
             first_prediction_index INTEGER,
             first_correct_index INTEGER,
             stabilized_index INTEGER,
@@ -79,6 +80,8 @@ def ensure_metrics_table(conn: sqlite3.Connection):
         cur.execute("ALTER TABLE reasoning_trace_forced_solution_metrics ADD COLUMN continuation_texts_json TEXT NOT NULL DEFAULT '[]'")
     if "token_confidences_json" not in cols:
         cur.execute("ALTER TABLE reasoning_trace_forced_solution_metrics ADD COLUMN token_confidences_json TEXT NOT NULL DEFAULT '[]'")
+    if "letter_probs_json" not in cols:
+        cur.execute("ALTER TABLE reasoning_trace_forced_solution_metrics ADD COLUMN letter_probs_json TEXT NOT NULL DEFAULT '[]'")
     conn.commit()
 
 
@@ -145,6 +148,7 @@ def upsert_metrics(
     predictions: List[Optional[str]],
     continuation_texts: List[str],
     token_confidences: List[List[float]],
+    letter_probs: List[Dict[str, float]],
     first_prediction_index: Optional[int],
     first_correct_index: Optional[int],
     stabilized_index: Optional[int],
@@ -159,15 +163,17 @@ def upsert_metrics(
         INSERT INTO reasoning_trace_forced_solution_metrics (
             trace_id, model_path, model_name, system_prompt, num_chunks, predictions_json,
             continuation_texts_json, token_confidences_json,
+            letter_probs_json,
             first_prediction_index, first_correct_index, stabilized_index, stabilized_value,
             num_changes, correct_at_first_chunk, overall_correct, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(trace_id, model_path, model_name, system_prompt)
         DO UPDATE SET
             num_chunks = excluded.num_chunks,
             predictions_json = excluded.predictions_json,
             continuation_texts_json = excluded.continuation_texts_json,
             token_confidences_json = excluded.token_confidences_json,
+            letter_probs_json = excluded.letter_probs_json,
             first_prediction_index = excluded.first_prediction_index,
             first_correct_index = excluded.first_correct_index,
             stabilized_index = excluded.stabilized_index,
@@ -186,6 +192,7 @@ def upsert_metrics(
             json.dumps(predictions),
             json.dumps(continuation_texts),
             json.dumps(token_confidences),
+            json.dumps(letter_probs),
             first_prediction_index,
             first_correct_index,
             stabilized_index,
@@ -218,6 +225,19 @@ class Qwen3Forcing:
         )
         self.model_name = model_name
         logger.info("Model loaded")
+
+        # Precompute candidate token ids for letters A..D
+        self.letter_to_token_ids: Dict[str, List[int]] = {}
+        for letter in ["A", "B", "C", "D"]:
+            variants = [letter, f" {letter}"]
+            ids: List[int] = []
+            for v in variants:
+                enc = self.tokenizer.encode(v, add_special_tokens=False)
+                if len(enc) == 1:
+                    ids.append(enc[0])
+            # Deduplicate
+            ids = list(dict.fromkeys(ids))
+            self.letter_to_token_ids[letter] = ids
 
     @torch.no_grad()
     def forced_solution(
@@ -269,6 +289,75 @@ class Qwen3Forcing:
             logger.error("Forced solution generation failed: %s", e)
             return None
 
+    @torch.no_grad()
+    def letter_probs_first_nonspace(
+        self,
+        system_prompt: Optional[str],
+        user_prompt: str,
+        think_prefix: str,
+        whitespace_topk: int = 3,
+        topk_probe: int = 50,
+    ) -> Dict[str, float]:
+        """Probability for A..D at the first non-whitespace position after </think>.
+
+        Approximates P(letter) = P(letter at t0) + Σ_{s in top-K whitespace} P(s at t0) * P(letter at t1 | s).
+        """
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
+        header = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        templated = header + f"<think>\n{think_prefix}{QWEN3_SPECIAL_STOPPING_PROMPT}"
+
+        inputs = self.tokenizer(templated, return_tensors="pt")
+        outputs = self.model(**inputs)
+        logits = outputs.logits  # [1, seq_len, vocab]
+        next_logits = logits[0, -1]
+        probs = torch.softmax(next_logits.float(), dim=-1)
+
+        # Direct contribution at t0
+        direct: Dict[str, float] = {}
+        for letter, ids in self.letter_to_token_ids.items():
+            if not ids:
+                direct[letter] = 0.0
+                continue
+            direct[letter] = max(float(probs[i].item()) for i in ids)
+
+        # Identify whitespace candidates among top-K next tokens
+        top_vals, top_ids = torch.topk(probs, k=min(topk_probe, probs.shape[-1]))
+        whitespace_ids: List[Tuple[int, float]] = []
+        for val, tid in zip(top_vals.tolist(), top_ids.tolist()):
+            text = self.tokenizer.decode([tid])
+            if text != "" and text.isspace():
+                whitespace_ids.append((tid, float(val)))
+            if len(whitespace_ids) >= whitespace_topk:
+                break
+
+        # Marginalize over whitespace candidates
+        contrib = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+        if whitespace_ids:
+            base_ids = inputs["input_ids"]
+            for tid, p_s in whitespace_ids:
+                concat = torch.cat([base_ids, torch.tensor([[tid]], dtype=base_ids.dtype)], dim=1)
+                attn = torch.ones_like(concat)
+                out2 = self.model(input_ids=concat, attention_mask=attn)
+                logits2 = out2.logits[0, -1]
+                probs2 = torch.softmax(logits2.float(), dim=-1)
+                for letter, ids in self.letter_to_token_ids.items():
+                    if not ids:
+                        continue
+                    p2 = max(float(probs2[i].item()) for i in ids)
+                    contrib[letter] += p_s * p2
+
+        out = {}
+        for letter in ["A", "B", "C", "D"]:
+            out[letter] = min(1.0, direct.get(letter, 0.0) + contrib.get(letter, 0.0))
+        return out
+
 
 LETTER_RE = re.compile(r"\b([A-Da-d])\b")
 
@@ -288,10 +377,11 @@ def compute_predictions_per_prefix(
     chunks: List[str],
     system_prompt: Optional[str],
     max_new_tokens: int,
-) -> tuple[List[Optional[str]], List[str], List[List[float]]]:
+) -> tuple[List[Optional[str]], List[str], List[List[float]], List[Dict[str, float]]]:
     predictions: List[Optional[str]] = []
     continuations: List[str] = []
     confidences: List[List[float]] = []
+    letter_probs: List[Dict[str, float]] = []
     for i in range(len(chunks)):
         think_prefix = "\n\n".join(chunks[: i + 1])
         forced = forcing.forced_solution(prompt_text, think_prefix, system_prompt, max_new_tokens)
@@ -299,13 +389,19 @@ def compute_predictions_per_prefix(
             continuations.append("")
             confidences.append([])
             predictions.append(None)
+            letter_probs.append({})
             continue
         cont_text, token_probs = forced
         letter = extract_letter(cont_text)
         predictions.append(letter)
         continuations.append(cont_text)
         confidences.append(token_probs)
-    return predictions, continuations, confidences
+
+        # Also compute letter probabilities
+        probs = forcing.letter_probs_first_nonspace(system_prompt, prompt_text, think_prefix)
+        letter_probs.append(probs)
+
+    return predictions, continuations, confidences, letter_probs
 
 
 def compute_metrics(
@@ -416,6 +512,7 @@ def run(
                 predictions=[],
                 continuation_texts=[],
                 token_confidences=[],
+                letter_probs=[],
                 first_prediction_index=None,
                 first_correct_index=None,
                 stabilized_index=None,
@@ -438,6 +535,7 @@ def run(
                 predictions=[],
                 continuation_texts=[],
                 token_confidences=[],
+                letter_probs=[],
                 first_prediction_index=None,
                 first_correct_index=None,
                 stabilized_index=None,
@@ -449,7 +547,7 @@ def run(
             continue
 
         prompt_text = compose_user_prompt(row.question_text, row.choices)
-        predictions, continuation_texts, token_confidences = compute_predictions_per_prefix(
+        predictions, continuation_texts, token_confidences, letter_probs = compute_predictions_per_prefix(
             forcing,
             prompt_text,
             chunks,
@@ -468,6 +566,7 @@ def run(
             predictions=predictions,
             continuation_texts=continuation_texts,
             token_confidences=token_confidences,
+            letter_probs=letter_probs,
             first_prediction_index=metrics["first_prediction_index"],
             first_correct_index=metrics["first_correct_index"],
             stabilized_index=metrics["stabilized_index"],

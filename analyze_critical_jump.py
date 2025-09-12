@@ -253,7 +253,7 @@ def run(
     rows = list(cur.execute(sql, params))
     if not rows:
         logger.info("No rows matched the criteria.")
-        return 0
+        return
 
     records: List[Dict] = []
 
@@ -366,7 +366,7 @@ def run(
 
     if not records:
         logger.info("No eligible examples after filtering.")
-        return 0
+        return
 
     df = pd.DataFrame.from_records(records)
 
@@ -384,7 +384,7 @@ def run(
 
     # Plots (skip plots in dry mode with explicit trace_ids)
     if dry_run and wanted_ids is not None:
-        return 0
+        return
 
     # Plots
     sns.set_theme(style="whitegrid")
@@ -406,12 +406,9 @@ def run(
     ax.set_ylabel("Delta confidence (GT)")
 
     plt.tight_layout()
+    plt.savefig("analysis_results/critical_jump.png")
     plt.show()
-
-    return 0
 
 
 if __name__ == "__main__":
     fire.Fire(run)
-
-
