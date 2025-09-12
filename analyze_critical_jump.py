@@ -10,6 +10,7 @@ import pandas as pd
 import seaborn as sns
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from tqdm.auto import tqdm
 
 from rc_utils import (
     QWEN3_SPECIAL_STOPPING_PROMPT,
@@ -87,6 +88,115 @@ class Qwen3Scorer:
             out[letter] = p
         return out
 
+    @torch.no_grad()
+    def letter_probs_first_nonspace(
+        self,
+        system_prompt: Optional[str],
+        user_prompt: str,
+        think_prefix: str,
+        whitespace_topk: int = 3,
+        topk_probe: int = 50,
+    ) -> Dict[str, float]:
+        """Probability for A..D at the first non-whitespace position after </think>.
+
+        Approximates P(letter) = P(letter at t0) + Σ_{s in top-K whitespace} P(s at t0) * P(letter at t1 | s).
+        """
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
+        header = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        templated = header + f"<think>\n{think_prefix}{QWEN3_SPECIAL_STOPPING_PROMPT}"
+
+        inputs = self.tokenizer(templated, return_tensors="pt")
+        outputs = self.model(**inputs)
+        logits = outputs.logits  # [1, seq_len, vocab]
+        next_logits = logits[0, -1]
+        probs = torch.softmax(next_logits.float(), dim=-1)
+
+        # Direct contribution at t0
+        direct: Dict[str, float] = {}
+        for letter, ids in self.letter_to_token_ids.items():
+            if not ids:
+                direct[letter] = 0.0
+                continue
+            direct[letter] = max(float(probs[i].item()) for i in ids)
+
+        # Identify whitespace candidates among top-K next tokens
+        top_vals, top_ids = torch.topk(probs, k=min(topk_probe, probs.shape[-1]))
+        whitespace_ids: List[Tuple[int, float]] = []
+        for val, tid in zip(top_vals.tolist(), top_ids.tolist()):
+            text = self.tokenizer.decode([tid])
+            if text != "" and text.isspace():
+                whitespace_ids.append((tid, float(val)))
+            if len(whitespace_ids) >= whitespace_topk:
+                break
+
+        # Marginalize over whitespace candidates
+        contrib = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+        if whitespace_ids:
+            base_ids = inputs["input_ids"]
+            for tid, p_s in whitespace_ids:
+                concat = torch.cat([base_ids, torch.tensor([[tid]], dtype=base_ids.dtype)], dim=1)
+                attn = torch.ones_like(concat)
+                out2 = self.model(input_ids=concat, attention_mask=attn)
+                logits2 = out2.logits[0, -1]
+                probs2 = torch.softmax(logits2.float(), dim=-1)
+                for letter, ids in self.letter_to_token_ids.items():
+                    if not ids:
+                        continue
+                    p2 = max(float(probs2[i].item()) for i in ids)
+                    contrib[letter] += p_s * p2
+
+        out = {}
+        for letter in ["A", "B", "C", "D"]:
+            out[letter] = min(1.0, direct.get(letter, 0.0) + contrib.get(letter, 0.0))
+        return out
+
+    @torch.no_grad()
+    def short_rollout(
+        self,
+        system_prompt: Optional[str],
+        user_prompt: str,
+        think_prefix: str,
+        max_new_tokens: int = 5,
+    ) -> List[Tuple[int, str, float]]:
+        """Deterministic short rollout returning list of (token_id, text, prob)."""
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_prompt})
+        header = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        templated = header + f"<think>\n{think_prefix}{QWEN3_SPECIAL_STOPPING_PROMPT}"
+        inputs = self.tokenizer(templated, return_tensors="pt")
+        gen = self.model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            output_scores=True,
+            return_dict_in_generate=True,
+        )
+        seq = gen.sequences
+        scores = gen.scores or []
+        prompt_len = inputs["input_ids"].shape[1]
+        new_ids = seq[0, prompt_len:]
+        triples: List[Tuple[int, str, float]] = []
+        for t, tok_id in enumerate(new_ids.tolist()):
+            logits_t = scores[t][0]
+            probs_t = torch.softmax(logits_t.float(), dim=-1)
+            prob = float(probs_t[tok_id].item())
+            text = self.tokenizer.decode([tok_id])
+            triples.append((tok_id, text, prob))
+        return triples
+
 
 def run(
     sqlite_db: str,
@@ -97,6 +207,10 @@ def run(
     max_rel_pos: float = 1.0,
     require_stabilized: bool = True,
     head_limit: Optional[int] = None,
+    dry_run: bool = False,
+    trace_ids: Optional[str] = None,
+    whitespace_topk: int = 3,
+    debug_rollout_tokens: int = 5,
 ):
     """Analyze local confidence jump at the first-correct chunk (no DB writes).
 
@@ -143,8 +257,17 @@ def run(
 
     records: List[Dict] = []
 
-    for r in rows:
+    wanted_ids: Optional[set] = None
+    if trace_ids:
+        try:
+            wanted_ids = {int(x.strip()) for x in trace_ids.split(",") if x.strip()}
+        except Exception:
+            wanted_ids = None
+
+    for r in tqdm(rows, desc="Scoring boundaries"):
         trace_id = r["trace_id"]
+        if wanted_ids is not None and trace_id not in wanted_ids:
+            continue
         num_chunks = int(r["num_chunks"]) if r["num_chunks"] is not None else 0
         k = int(r["first_correct_index"]) if r["first_correct_index"] is not None else -1
         if num_chunks <= 0 or k <= 0 or k >= num_chunks:
@@ -188,14 +311,15 @@ def run(
             # As a fallback, skip this trace
             continue
 
-        probs_k = scorer.letter_probs(system_prompt, user_prompt, prefix_k)
-        probs_km1 = scorer.letter_probs(system_prompt, user_prompt, prefix_km1)
+        # Compute letter probabilities at first non-space
+        probs_k = scorer.letter_probs_first_nonspace(system_prompt, user_prompt, prefix_k, whitespace_topk=whitespace_topk)
+        probs_km1 = scorer.letter_probs_first_nonspace(system_prompt, user_prompt, prefix_km1, whitespace_topk=whitespace_topk)
 
         pk = float(probs_k.get(gt_letter, 0.0))
         pkm1 = float(probs_km1.get(gt_letter, 0.0))
         delta = pk - pkm1
 
-        records.append({
+        rec = {
             "trace_id": trace_id,
             "k": k,
             "num_chunks": num_chunks,
@@ -204,7 +328,41 @@ def run(
             "p_k": pk,
             "p_km1": pkm1,
             "delta": delta,
-        })
+        }
+
+        if dry_run and (wanted_ids is None or trace_id in wanted_ids):
+            print(f"\n=== DRY TRACE {trace_id} (k={k}/{num_chunks}, rel={rel:.3f}) ===")
+            # Next-token top-10 for both contexts
+            for label, prefix in [("km1", prefix_km1), ("k", prefix_k)]:
+                messages = []
+                if system_prompt:
+                    messages.append({"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": user_prompt})
+                header = scorer.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                templ = header + f"<think>\n{prefix}{QWEN3_SPECIAL_STOPPING_PROMPT}"
+                inp = scorer.tokenizer(templ, return_tensors="pt")
+                out = scorer.model(**inp)
+                nxt = out.logits[0, -1]
+                pr = torch.softmax(nxt.float(), dim=-1)
+                vals, ids = torch.topk(pr, k=10)
+                print(f"-- next-token top10 [{label}] --")
+                for v, tid in zip(vals.tolist(), ids.tolist()):
+                    tx = scorer.tokenizer.decode([tid])
+                    print(f"  id={tid:>6} prob={v:.4f} text={repr(tx)} isspace={tx.isspace() if tx != '' else False}")
+            # Letter probs and short rollout
+            print(f"P_km1: {probs_km1}")
+            print(f"P_k  : {probs_k}")
+            print(f"delta: {delta:.4f}")
+            ro_km1 = scorer.short_rollout(system_prompt, user_prompt, prefix_km1, max_new_tokens=debug_rollout_tokens)
+            ro_k = scorer.short_rollout(system_prompt, user_prompt, prefix_k, max_new_tokens=debug_rollout_tokens)
+            print("-- rollout km1 --")
+            for (tid, tx, p) in ro_km1:
+                print(f"  id={tid:>6} prob={p:.4f} text={repr(tx)} isspace={tx.isspace() if tx != '' else False}")
+            print("-- rollout k --")
+            for (tid, tx, p) in ro_k:
+                print(f"  id={tid:>6} prob={p:.4f} text={repr(tx)} isspace={tx.isspace() if tx != '' else False}")
+
+        records.append(rec)
 
     if not records:
         logger.info("No eligible examples after filtering.")
@@ -223,6 +381,10 @@ def run(
     big_gain = (df["delta"] >= 0.2).mean()
     print(f"share_large_negative_delta(<=-0.2): {big_drop:.3f}")
     print(f"share_large_positive_delta(>=0.2): {big_gain:.3f}")
+
+    # Plots (skip plots in dry mode with explicit trace_ids)
+    if dry_run and wanted_ids is not None:
+        return 0
 
     # Plots
     sns.set_theme(style="whitegrid")
