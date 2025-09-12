@@ -137,6 +137,41 @@ def has_existing_metrics(
     return cur.fetchone() is not None
 
 
+def fetch_existing_jsons(
+    conn: sqlite3.Connection, trace_id: int, model_path: str, model_name: str, system_prompt: str
+) -> Optional[dict]:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT num_chunks, predictions_json, continuation_texts_json, token_confidences_json, letter_probs_json
+        FROM reasoning_trace_forced_solution_metrics
+        WHERE trace_id = ? AND model_path = ? AND model_name = ? AND system_prompt = ?
+        LIMIT 1
+        """,
+        (trace_id, model_path, model_name, system_prompt),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return {
+        "num_chunks": row[0],
+        "predictions_json": row[1],
+        "continuation_texts_json": row[2],
+        "token_confidences_json": row[3],
+        "letter_probs_json": row[4],
+    }
+
+
+def _json_list_or_empty(s: Optional[str]) -> list:
+    if not s:
+        return []
+    try:
+        v = json.loads(s)
+        return v if isinstance(v, list) else []
+    except Exception:
+        return []
+
+
 def upsert_metrics(
     conn: sqlite3.Connection,
     *,
@@ -496,6 +531,55 @@ def run(
         return 0
 
     for row in tqdm(rows, desc="Processing traces"):
+        if only_missing and has_existing_metrics(conn, row.id, row.model_path, forcing.model_name, system_prompt):
+            # Per-column fill: only compute missing letter_probs_json
+            existing = fetch_existing_jsons(conn, row.id, row.model_path, forcing.model_name, system_prompt)
+            if not existing:
+                continue
+            existing_letter_probs = _json_list_or_empty(existing.get("letter_probs_json"))
+            if existing_letter_probs:
+                # Nothing to fill for this row
+                continue
+            # Need to compute only letter_probs for this row
+            think = extract_think_content(row.full_prompt_text)
+            if not think:
+                # Keep row as-is, skip
+                continue
+            chunks = split_reasoning_chain(think)
+            if not chunks:
+                continue
+            prompt_text = compose_user_prompt(row.question_text, row.choices)
+            letter_probs: List[Dict[str, float]] = []
+            for i in range(len(chunks)):
+                think_prefix = "\n\n".join(chunks[: i + 1])
+                probs = forcing.letter_probs_first_nonspace(system_prompt, prompt_text, think_prefix)
+                letter_probs.append(probs)
+            # Reuse existing JSON fields
+            preds = _json_list_or_empty(existing.get("predictions_json"))
+            conts = _json_list_or_empty(existing.get("continuation_texts_json"))
+            confs = _json_list_or_empty(existing.get("token_confidences_json"))
+            # Upsert with only letter_probs updated; others preserved
+            upsert_metrics(
+                conn,
+                trace_id=row.id,
+                model_path=row.model_path,
+                model_name=forcing.model_name,
+                system_prompt=system_prompt,
+                num_chunks=len(chunks),
+                predictions=preds,
+                continuation_texts=conts,
+                token_confidences=confs,
+                letter_probs=letter_probs,
+                first_prediction_index=None,
+                first_correct_index=None,
+                stabilized_index=None,
+                stabilized_value=None,
+                num_changes=0,
+                correct_at_first_chunk=False,
+                overall_correct=False,
+            )
+            continue
+
         if only_missing and has_existing_metrics(conn, row.id, row.model_path, forcing.model_name, system_prompt):
             continue
 
