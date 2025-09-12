@@ -137,82 +137,6 @@ def has_existing_metrics(
     return cur.fetchone() is not None
 
 
-def fetch_existing_flags(
-    conn: sqlite3.Connection, trace_id: int, model_path: str, model_name: str, system_prompt: str
-) -> Optional[dict]:
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT first_correct_index, overall_correct
-        FROM reasoning_trace_forced_solution_metrics
-        WHERE trace_id = ? AND model_path = ? AND model_name = ? AND system_prompt = ?
-        LIMIT 1
-        """,
-        (trace_id, model_path, model_name, system_prompt),
-    )
-    row = cur.fetchone()
-    if not row:
-        return None
-    return {"first_correct_index": row[0], "overall_correct": row[1]}
-
-
-def fetch_existing_jsons(
-    conn: sqlite3.Connection, trace_id: int, model_path: str, model_name: str, system_prompt: str
-) -> Optional[dict]:
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT num_chunks, predictions_json, continuation_texts_json, token_confidences_json, letter_probs_json
-        FROM reasoning_trace_forced_solution_metrics
-        WHERE trace_id = ? AND model_path = ? AND model_name = ? AND system_prompt = ?
-        LIMIT 1
-        """,
-        (trace_id, model_path, model_name, system_prompt),
-    )
-    row = cur.fetchone()
-    if not row:
-        return None
-    return {
-        "num_chunks": row[0],
-        "predictions_json": row[1],
-        "continuation_texts_json": row[2],
-        "token_confidences_json": row[3],
-        "letter_probs_json": row[4],
-    }
-
-
-def fetch_critical_ids(
-    conn: sqlite3.Connection,
-    *,
-    model_path: str,
-    model_name: str,
-    system_prompt: str,
-    only_missing_letter_probs: bool,
-) -> set:
-    cur = conn.cursor()
-    base = (
-        "SELECT trace_id FROM reasoning_trace_forced_solution_metrics "
-        "WHERE model_path = ? AND model_name = ? AND system_prompt = ? "
-        "AND first_correct_index IS NOT NULL AND first_correct_index > 0 "
-        "AND overall_correct = 1"
-    )
-    params = [model_path, model_name, system_prompt]
-    if only_missing_letter_probs:
-        base += " AND (letter_probs_json IS NULL OR letter_probs_json = '' OR letter_probs_json = '[]')"
-    cur.execute(base, params)
-    return {row[0] for row in cur.fetchall()}
-
-
-def _json_list_or_empty(s: Optional[str]) -> list:
-    if not s:
-        return []
-    try:
-        v = json.loads(s)
-        return v if isinstance(v, list) else []
-    except Exception:
-        return []
-
-
 def upsert_metrics(
     conn: sqlite3.Connection,
     *,
@@ -551,9 +475,9 @@ def run(
     system_prompt: str = "Answer only with a letter of a correct choice.",
     limit: Optional[int] = None,
     offset: int = 0,
-    only_missing: bool = False,
+    only_missing_letter_probs: bool = False,
+    only_with_critical_chunk: bool = False,
     max_new_tokens: int = 20,
-    only_critical: bool = False,
 ):
     """Precompute Forced Solution stability metrics into SQLite.
 
@@ -567,144 +491,44 @@ def run(
     conn = sqlite3.connect(sqlite_db)
     ensure_metrics_table(conn)
 
+    # --- Selective Processing Logic ---
+    # 1. Get IDs that already have letter_probs filled
+    processed_ids = set()
+    if only_missing_letter_probs:
+        cur = conn.cursor()
+        cur.execute("SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE letter_probs_json IS NOT NULL AND letter_probs_json != '[]'")
+        processed_ids = {row[0] for row in cur.fetchall()}
+        logger.info(f"Found {len(processed_ids)} rows with existing letter_probs, will skip them.")
+
+    # 2. Get IDs that have a "critical chunk" to focus on them if requested
+    critical_ids = set()
+    if only_with_critical_chunk:
+        cur = conn.cursor()
+        # A "critical chunk" exists if the first correct answer was not on the first chunk
+        cur.execute("SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE first_correct_index IS NOT NULL AND first_correct_index > 0")
+        critical_ids = {row[0] for row in cur.fetchall()}
+        logger.info(f"Found {len(critical_ids)} rows with a critical chunk. Will process only these if they are missing letter_probs.")
+
     rows = fetch_rows(conn, where_model_path, limit, offset)
     if not rows:
         logger.info("No rows found")
         return 0
 
-    # Prefilter rows for tqdm when only_critical is requested
-    if only_critical:
-        crit_ids = fetch_critical_ids(
-            conn,
-            model_path=where_model_path,
-            model_name=model_name,
-            system_prompt=system_prompt,
-            only_missing_letter_probs=only_missing,
-        )
-        if crit_ids:
-            rows = [r for r in rows if r.id in crit_ids]
-        else:
-            rows = []
-
     for row in tqdm(rows, desc="Processing traces"):
-        exists = has_existing_metrics(conn, row.id, row.model_path, forcing.model_name, system_prompt)
-
-        if only_missing and exists:
-            # Per-column fill: only compute missing letter_probs_json
-            existing = fetch_existing_jsons(conn, row.id, row.model_path, forcing.model_name, system_prompt)
-            if not existing:
-                continue
-            if only_critical:
-                flags = fetch_existing_flags(conn, row.id, row.model_path, forcing.model_name, system_prompt)
-                if not flags:
-                    continue
-                if not (flags.get("first_correct_index") is not None and int(flags.get("first_correct_index")) > 0 and int(flags.get("overall_correct", 0)) == 1):
-                    # Skip non-critical traces
-                    continue
-            existing_letter_probs = _json_list_or_empty(existing.get("letter_probs_json"))
-            if existing_letter_probs:
-                # Nothing to fill for this row
-                continue
-            # Need to compute only letter_probs for this row
-            think = extract_think_content(row.full_prompt_text)
-            if not think:
-                # Keep row as-is, skip
-                continue
-            chunks = split_reasoning_chain(think)
-            if not chunks:
-                continue
-            prompt_text = compose_user_prompt(row.question_text, row.choices)
-            letter_probs: List[Dict[str, float]] = []
-            for i in range(len(chunks)):
-                think_prefix = "\n\n".join(chunks[: i + 1])
-                probs = forcing.letter_probs_first_nonspace(system_prompt, prompt_text, think_prefix)
-                letter_probs.append(probs)
-            # Reuse existing JSON fields
-            preds = _json_list_or_empty(existing.get("predictions_json"))
-            conts = _json_list_or_empty(existing.get("continuation_texts_json"))
-            confs = _json_list_or_empty(existing.get("token_confidences_json"))
-            # Upsert with only letter_probs updated; others preserved
-            upsert_metrics(
-                conn,
-                trace_id=row.id,
-                model_path=row.model_path,
-                model_name=forcing.model_name,
-                system_prompt=system_prompt,
-                num_chunks=len(chunks),
-                predictions=preds,
-                continuation_texts=conts,
-                token_confidences=confs,
-                letter_probs=letter_probs,
-                first_prediction_index=None,
-                first_correct_index=None,
-                stabilized_index=None,
-                stabilized_value=None,
-                num_changes=0,
-                correct_at_first_chunk=False,
-                overall_correct=False,
-            )
+        # Apply selective processing filters
+        if only_missing_letter_probs and row.id in processed_ids:
             continue
-
-        # If only_missing and metrics do not exist, skip entirely (do not compute new rows)
-        if only_missing and not exists:
+        if only_with_critical_chunk and row.id not in critical_ids:
             continue
-
-        # If only_critical is requested, require existing critical flags; skip otherwise
-        if only_critical:
-            if not exists:
-                # Do not compute new metrics to determine criticality
-                continue
-            flags = fetch_existing_flags(conn, row.id, row.model_path, forcing.model_name, system_prompt)
-            if not flags:
-                continue
-            if not (flags.get("first_correct_index") is not None and int(flags.get("first_correct_index")) > 0 and int(flags.get("overall_correct", 0)) == 1):
-                continue
 
         think = extract_think_content(row.full_prompt_text)
         if not think:
-            # Store empty metrics for trace to avoid revisiting repeatedly
-            upsert_metrics(
-                conn,
-                trace_id=row.id,
-                model_path=row.model_path,
-                model_name=forcing.model_name,
-                system_prompt=system_prompt,
-                num_chunks=0,
-                predictions=[],
-                continuation_texts=[],
-                token_confidences=[],
-                letter_probs=[],
-                first_prediction_index=None,
-                first_correct_index=None,
-                stabilized_index=None,
-                stabilized_value=None,
-                num_changes=0,
-                correct_at_first_chunk=False,
-                overall_correct=False,
-            )
+            # Note: We don't upsert empty metrics here anymore because this mode is for backfilling.
+            # If a row has no think content, it will just be skipped.
             continue
 
         chunks = split_reasoning_chain(think)
         if not chunks:
-            upsert_metrics(
-                conn,
-                trace_id=row.id,
-                model_path=row.model_path,
-                model_name=forcing.model_name,
-                system_prompt=system_prompt,
-                num_chunks=0,
-                predictions=[],
-                continuation_texts=[],
-                token_confidences=[],
-                letter_probs=[],
-                first_prediction_index=None,
-                first_correct_index=None,
-                stabilized_index=None,
-                stabilized_value=None,
-                num_changes=0,
-                correct_at_first_chunk=False,
-                overall_correct=False,
-            )
             continue
 
         prompt_text = compose_user_prompt(row.question_text, row.choices)
