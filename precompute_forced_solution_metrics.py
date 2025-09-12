@@ -137,6 +137,25 @@ def has_existing_metrics(
     return cur.fetchone() is not None
 
 
+def fetch_existing_flags(
+    conn: sqlite3.Connection, trace_id: int, model_path: str, model_name: str, system_prompt: str
+) -> Optional[dict]:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT first_correct_index, overall_correct
+        FROM reasoning_trace_forced_solution_metrics
+        WHERE trace_id = ? AND model_path = ? AND model_name = ? AND system_prompt = ?
+        LIMIT 1
+        """,
+        (trace_id, model_path, model_name, system_prompt),
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    return {"first_correct_index": row[0], "overall_correct": row[1]}
+
+
 def fetch_existing_jsons(
     conn: sqlite3.Connection, trace_id: int, model_path: str, model_name: str, system_prompt: str
 ) -> Optional[dict]:
@@ -512,6 +531,7 @@ def run(
     offset: int = 0,
     only_missing: bool = False,
     max_new_tokens: int = 20,
+    only_critical: bool = False,
 ):
     """Precompute Forced Solution stability metrics into SQLite.
 
@@ -531,11 +551,20 @@ def run(
         return 0
 
     for row in tqdm(rows, desc="Processing traces"):
-        if only_missing and has_existing_metrics(conn, row.id, row.model_path, forcing.model_name, system_prompt):
+        exists = has_existing_metrics(conn, row.id, row.model_path, forcing.model_name, system_prompt)
+
+        if only_missing and exists:
             # Per-column fill: only compute missing letter_probs_json
             existing = fetch_existing_jsons(conn, row.id, row.model_path, forcing.model_name, system_prompt)
             if not existing:
                 continue
+            if only_critical:
+                flags = fetch_existing_flags(conn, row.id, row.model_path, forcing.model_name, system_prompt)
+                if not flags:
+                    continue
+                if not (flags.get("first_correct_index") is not None and int(flags.get("first_correct_index")) > 0 and int(flags.get("overall_correct", 0)) == 1):
+                    # Skip non-critical traces
+                    continue
             existing_letter_probs = _json_list_or_empty(existing.get("letter_probs_json"))
             if existing_letter_probs:
                 # Nothing to fill for this row
@@ -580,8 +609,20 @@ def run(
             )
             continue
 
-        if only_missing and has_existing_metrics(conn, row.id, row.model_path, forcing.model_name, system_prompt):
+        # If only_missing and metrics do not exist, skip entirely (do not compute new rows)
+        if only_missing and not exists:
             continue
+
+        # If only_critical is requested, require existing critical flags; skip otherwise
+        if only_critical:
+            if not exists:
+                # Do not compute new metrics to determine criticality
+                continue
+            flags = fetch_existing_flags(conn, row.id, row.model_path, forcing.model_name, system_prompt)
+            if not flags:
+                continue
+            if not (flags.get("first_correct_index") is not None and int(flags.get("first_correct_index")) > 0 and int(flags.get("overall_correct", 0)) == 1):
+                continue
 
         think = extract_think_content(row.full_prompt_text)
         if not think:
