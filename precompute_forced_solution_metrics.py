@@ -181,6 +181,28 @@ def fetch_existing_jsons(
     }
 
 
+def fetch_critical_ids(
+    conn: sqlite3.Connection,
+    *,
+    model_path: str,
+    model_name: str,
+    system_prompt: str,
+    only_missing_letter_probs: bool,
+) -> set:
+    cur = conn.cursor()
+    base = (
+        "SELECT trace_id FROM reasoning_trace_forced_solution_metrics "
+        "WHERE model_path = ? AND model_name = ? AND system_prompt = ? "
+        "AND first_correct_index IS NOT NULL AND first_correct_index > 0 "
+        "AND overall_correct = 1"
+    )
+    params = [model_path, model_name, system_prompt]
+    if only_missing_letter_probs:
+        base += " AND (letter_probs_json IS NULL OR letter_probs_json = '' OR letter_probs_json = '[]')"
+    cur.execute(base, params)
+    return {row[0] for row in cur.fetchall()}
+
+
 def _json_list_or_empty(s: Optional[str]) -> list:
     if not s:
         return []
@@ -549,6 +571,20 @@ def run(
     if not rows:
         logger.info("No rows found")
         return 0
+
+    # Prefilter rows for tqdm when only_critical is requested
+    if only_critical:
+        crit_ids = fetch_critical_ids(
+            conn,
+            model_path=where_model_path,
+            model_name=model_name,
+            system_prompt=system_prompt,
+            only_missing_letter_probs=only_missing,
+        )
+        if crit_ids:
+            rows = [r for r in rows if r.id in crit_ids]
+        else:
+            rows = []
 
     for row in tqdm(rows, desc="Processing traces"):
         exists = has_existing_metrics(conn, row.id, row.model_path, forcing.model_name, system_prompt)
