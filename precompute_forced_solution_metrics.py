@@ -492,35 +492,47 @@ def run(
     ensure_metrics_table(conn)
 
     # --- Selective Processing Logic ---
-    # 1. Get IDs that already have letter_probs filled
-    processed_ids = set()
-    if only_missing_letter_probs:
-        cur = conn.cursor()
-        cur.execute("SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE letter_probs_json IS NOT NULL AND letter_probs_json != '[]'")
-        processed_ids = {row[0] for row in cur.fetchall()}
-        logger.info(f"Found {len(processed_ids)} rows with existing letter_probs, will skip them.")
-
-    # 2. Get IDs that have a "critical chunk" to focus on them if requested
-    critical_ids = set()
-    if only_with_critical_chunk:
-        cur = conn.cursor()
-        # A "critical chunk" exists if the first correct answer was not on the first chunk
-        cur.execute("SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE first_correct_index IS NOT NULL AND first_correct_index > 0")
-        critical_ids = {row[0] for row in cur.fetchall()}
-        logger.info(f"Found {len(critical_ids)} rows with a critical chunk. Will process only these if they are missing letter_probs.")
-
     rows = fetch_rows(conn, where_model_path, limit, offset)
     if not rows:
         logger.info("No rows found")
         return 0
 
-    for row in tqdm(rows, desc="Processing traces"):
-        # Apply selective processing filters
-        if only_missing_letter_probs and row.id in processed_ids:
-            continue
-        if only_with_critical_chunk and row.id not in critical_ids:
-            continue
+    # Filter rows *before* processing, so tqdm shows the correct total.
+    if only_missing_letter_probs or only_with_critical_chunk:
+        initial_count = len(rows)
+        
+        # 1. Get IDs that already have letter_probs filled
+        processed_ids = set()
+        if only_missing_letter_probs:
+            cur = conn.cursor()
+            cur.execute("SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE letter_probs_json IS NOT NULL AND letter_probs_json != '[]'")
+            processed_ids = {row[0] for row in cur.fetchall()}
+            logger.info(f"Found {len(processed_ids)} rows with existing letter_probs, will filter them out.")
 
+        # 2. Get IDs that have a "critical chunk" to focus on them if requested
+        critical_ids = set()
+        if only_with_critical_chunk:
+            cur = conn.cursor()
+            # A "critical chunk" exists if the first correct answer was not on the first chunk
+            cur.execute("SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE first_correct_index IS NOT NULL AND first_correct_index > 0")
+            critical_ids = {row[0] for row in cur.fetchall()}
+            logger.info(f"Found {len(critical_ids)} rows with a critical chunk. Filtering to process only these.")
+
+        # Apply filters
+        original_rows = rows
+        rows = []
+        for row in original_rows:
+            if only_missing_letter_probs and row.id in processed_ids:
+                continue
+            if only_with_critical_chunk and row.id not in critical_ids:
+                continue
+            rows.append(row)
+        
+        logger.info(f"Filtered {initial_count} rows down to {len(rows)} for processing.")
+
+
+    for row in tqdm(rows, desc="Processing traces"):
+        # Filters have already been applied above
         think = extract_think_content(row.full_prompt_text)
         if not think:
             # Note: We don't upsert empty metrics here anymore because this mode is for backfilling.
