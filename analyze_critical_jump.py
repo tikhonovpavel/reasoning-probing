@@ -25,15 +25,16 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen3Scorer:
-    def __init__(self, model_name: str):
+    def __init__(self, model_name: str, device_map: str = "auto"):
         logger.info("Loading model: %s", model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            device_map="auto",
+            device_map=device_map,
             dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         )
         self.model.eval()
+        self.device = self.model.device
         logger.info("Model loaded")
 
         # Precompute candidate token ids for letters A..D
@@ -72,7 +73,7 @@ class Qwen3Scorer:
         )
         templated = header + f"<think>\n{think_prefix}{QWEN3_SPECIAL_STOPPING_PROMPT}"
 
-        inputs = self.tokenizer(templated, return_tensors="pt")
+        inputs = self.tokenizer(templated, return_tensors="pt").to(self.device)
         outputs = self.model(**inputs)
         logits = outputs.logits  # [1, seq_len, vocab]
         next_logits = logits[0, -1]
@@ -112,7 +113,7 @@ class Qwen3Scorer:
         )
         templated = header + f"<think>\n{think_prefix}{QWEN3_SPECIAL_STOPPING_PROMPT}"
 
-        inputs = self.tokenizer(templated, return_tensors="pt")
+        inputs = self.tokenizer(templated, return_tensors="pt").to(self.device)
         outputs = self.model(**inputs)
         logits = outputs.logits  # [1, seq_len, vocab]
         next_logits = logits[0, -1]
@@ -141,7 +142,8 @@ class Qwen3Scorer:
         if whitespace_ids:
             base_ids = inputs["input_ids"]
             for tid, p_s in whitespace_ids:
-                concat = torch.cat([base_ids, torch.tensor([[tid]], dtype=base_ids.dtype)], dim=1)
+                new_id_tensor = torch.tensor([[tid]], dtype=base_ids.dtype, device=self.device)
+                concat = torch.cat([base_ids, new_id_tensor], dim=1)
                 attn = torch.ones_like(concat)
                 out2 = self.model(input_ids=concat, attention_mask=attn)
                 logits2 = out2.logits[0, -1]
@@ -176,7 +178,7 @@ class Qwen3Scorer:
             add_generation_prompt=True,
         )
         templated = header + f"<think>\n{think_prefix}{QWEN3_SPECIAL_STOPPING_PROMPT}"
-        inputs = self.tokenizer(templated, return_tensors="pt")
+        inputs = self.tokenizer(templated, return_tensors="pt").to(self.device)
         gen = self.model.generate(
             **inputs,
             max_new_tokens=max_new_tokens,
@@ -211,6 +213,7 @@ def run(
     trace_ids: Optional[str] = None,
     whitespace_topk: int = 3,
     debug_rollout_tokens: int = 5,
+    device_map: str = "auto",
 ):
     """Analyze local confidence jump at the first-correct chunk (no DB writes).
 
@@ -220,7 +223,7 @@ def run(
       as precompute_forced_solution_metrics.py, then report Δ = Pk - Pk-1.
     - Plot histogram of Δ and scatter of Δ vs (k/num_chunks).
     """
-    scorer = Qwen3Scorer(model_name)
+    scorer = Qwen3Scorer(model_name, device_map=device_map)
 
     conn = sqlite3.connect(sqlite_db)
     conn.row_factory = sqlite3.Row
@@ -340,7 +343,7 @@ def run(
                 messages.append({"role": "user", "content": user_prompt})
                 header = scorer.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                 templ = header + f"<think>\n{prefix}{QWEN3_SPECIAL_STOPPING_PROMPT}"
-                inp = scorer.tokenizer(templ, return_tensors="pt")
+                inp = scorer.tokenizer(templ, return_tensors="pt").to(scorer.device)
                 out = scorer.model(**inp)
                 nxt = out.logits[0, -1]
                 pr = torch.softmax(nxt.float(), dim=-1)

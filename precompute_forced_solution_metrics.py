@@ -252,6 +252,7 @@ class Qwen3Forcing:
             dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         )
         self.model_name = model_name
+        self.device = self.model.device
         logger.info("Model loaded")
 
         # Precompute candidate token ids for letters A..D
@@ -275,47 +276,43 @@ class Qwen3Forcing:
         system_prompt: Optional[str],
         max_new_tokens: int = 20,
     ) -> Optional[tuple[str, List[float]]]:
-        try:
-            messages = []
-            if system_prompt:
-                messages.append({"role": "system", "content": system_prompt})
-            messages.append({"role": "user", "content": prompt_text})
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt_text})
 
-            header = self.tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-            templated = header + f"<think>\n{think_content}{QWEN3_SPECIAL_STOPPING_PROMPT}"
+        header = self.tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        templated = header + f"<think>\n{think_content}{QWEN3_SPECIAL_STOPPING_PROMPT}"
 
-            inputs = self.tokenizer(templated, return_tensors="pt")
-            gen_out = self.model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                temperature=1.0,
-                top_p=1.0,
-                output_scores=True,
-                return_dict_in_generate=True,
-            )
-            output_ids = gen_out.sequences
-            scores = gen_out.scores or []
-            prompt_len = inputs["input_ids"].shape[1]
-            new_ids = output_ids[0, prompt_len:]
-            continuation = self.tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+        inputs = self.tokenizer(templated, return_tensors="pt").to(self.device)
+        gen_out = self.model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=1.0,
+            top_p=1.0,
+            output_scores=True,
+            return_dict_in_generate=True,
+        )
+        output_ids = gen_out.sequences
+        scores = gen_out.scores or []
+        prompt_len = inputs["input_ids"].shape[1]
+        new_ids = output_ids[0, prompt_len:]
+        continuation = self.tokenizer.decode(new_ids, skip_special_tokens=True).strip()
 
-            # Compute per-token confidences (softmax prob for chosen token at each step)
-            token_probs: List[float] = []
-            for t, logits in enumerate(scores):
-                probs = torch.nn.functional.softmax(logits[0], dim=-1)
-                tok_id = new_ids[t].item()
-                prob = probs[tok_id].detach().float().item()
-                token_probs.append(float(prob))
+        # Compute per-token confidences (softmax prob for chosen token at each step)
+        token_probs: List[float] = []
+        for t, logits in enumerate(scores):
+            probs = torch.nn.functional.softmax(logits[0], dim=-1)
+            tok_id = new_ids[t].item()
+            prob = probs[tok_id].detach().float().item()
+            token_probs.append(float(prob))
 
-            return continuation, token_probs
-        except Exception as e:
-            logger.error("Forced solution generation failed: %s", e)
-            return None
+        return continuation, token_probs
 
     @torch.no_grad()
     def letter_probs_first_nonspace(
@@ -341,7 +338,7 @@ class Qwen3Forcing:
         )
         templated = header + f"<think>\n{think_prefix}{QWEN3_SPECIAL_STOPPING_PROMPT}"
 
-        inputs = self.tokenizer(templated, return_tensors="pt")
+        inputs = self.tokenizer(templated, return_tensors="pt").to(self.device)
         outputs = self.model(**inputs)
         logits = outputs.logits  # [1, seq_len, vocab]
         next_logits = logits[0, -1]
@@ -370,7 +367,8 @@ class Qwen3Forcing:
         if whitespace_ids:
             base_ids = inputs["input_ids"]
             for tid, p_s in whitespace_ids:
-                concat = torch.cat([base_ids, torch.tensor([[tid]], dtype=base_ids.dtype)], dim=1)
+                new_id_tensor = torch.tensor([[tid]], dtype=base_ids.dtype, device=self.device)
+                concat = torch.cat([base_ids, new_id_tensor], dim=1)
                 attn = torch.ones_like(concat)
                 out2 = self.model(input_ids=concat, attention_mask=attn)
                 logits2 = out2.logits[0, -1]
@@ -522,6 +520,7 @@ def run(
     only_with_critical_chunk: bool = False,
     max_new_tokens: int = 20,
     fast_backfill: bool = False,
+    device_map: str = "auto",
 ):
     """Precompute Forced Solution stability metrics into SQLite.
 
@@ -529,7 +528,7 @@ def run(
     """
 
     # Load model
-    forcing = Qwen3Forcing(model_name)
+    forcing = Qwen3Forcing(model_name, device_map=device_map)
 
     # Connect DB
     conn = sqlite3.connect(sqlite_db)
@@ -540,7 +539,10 @@ def run(
         all_rows = fetch_rows(conn, where_model_path, limit, offset)
 
         cur = conn.cursor()
-        cur.execute("SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE letter_probs_json IS NOT NULL AND letter_probs_json != '[]'")
+        # Find rows that have actual data, not just empty placeholders like '[{}, {}]'
+        sql = "SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE letter_probs_json LIKE '%\"A\"%' AND model_name = ? AND model_path = ? AND system_prompt = ?"
+        params = (forcing.model_name, where_model_path, system_prompt)
+        cur.execute(sql, params)
         processed_ids = {row[0] for row in cur.fetchall()}
         
         initial_count = len(all_rows)
@@ -585,7 +587,10 @@ def run(
         processed_ids = set()
         if only_missing_letter_probs:
             cur = conn.cursor()
-            cur.execute("SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE letter_probs_json IS NOT NULL AND letter_probs_json != '[]'")
+            # Find rows that have actual data, not just empty placeholders like '[{}, {}]'
+            sql = "SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE letter_probs_json LIKE '%\"A\"%' AND model_name = ? AND model_path = ? AND system_prompt = ?"
+            params = (forcing.model_name, where_model_path, system_prompt)
+            cur.execute(sql, params)
             processed_ids = {row[0] for row in cur.fetchall()}
             logger.info(f"Found {len(processed_ids)} rows with existing letter_probs, will filter them out.")
 
