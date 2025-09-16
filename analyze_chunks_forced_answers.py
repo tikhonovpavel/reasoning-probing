@@ -3,6 +3,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 from scipy.stats import pointbiserialr, pearsonr
 
+
 # --- Config (relative path) ---
 DB_PATH = "./reasoning_traces.sqlite"
 FILTER_MODEL_PATH = "Qwen/Qwen3-32B"   # set to None to disable

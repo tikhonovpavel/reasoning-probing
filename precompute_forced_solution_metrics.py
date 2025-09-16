@@ -206,6 +206,34 @@ def upsert_metrics(
     conn.commit()
 
 
+def update_letter_probs_only(
+    conn: sqlite3.Connection,
+    *,
+    trace_id: int,
+    model_path: str,
+    model_name: str,
+    system_prompt: str,
+    letter_probs: List[Dict[str, float]],
+):
+    """Efficiently update only the letter_probs_json column for a given trace."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE reasoning_trace_forced_solution_metrics
+        SET letter_probs_json = ?
+        WHERE trace_id = ? AND model_path = ? AND model_name = ? AND system_prompt = ?
+        """,
+        (
+            json.dumps(letter_probs),
+            trace_id,
+            model_path,
+            model_name,
+            system_prompt,
+        ),
+    )
+    conn.commit()
+
+
 # ----------------------------------------------------------------------------
 # Text Utilities are imported from rc_utils
 # ----------------------------------------------------------------------------
@@ -295,7 +323,7 @@ class Qwen3Forcing:
         system_prompt: Optional[str],
         user_prompt: str,
         think_prefix: str,
-        whitespace_topk: int = 3,
+        whitespace_topk: int = 1,
         topk_probe: int = 50,
     ) -> Dict[str, float]:
         """Probability for A..D at the first non-whitespace position after </think>.
@@ -404,6 +432,21 @@ def compute_predictions_per_prefix(
     return predictions, continuations, confidences, letter_probs
 
 
+def compute_letter_probs_only(
+    forcing: Qwen3Forcing,
+    prompt_text: str,
+    chunks: List[str],
+    system_prompt: Optional[str],
+) -> List[Dict[str, float]]:
+    """Efficiently compute only letter probabilities for all prefixes."""
+    letter_probs: List[Dict[str, float]] = []
+    for i in range(len(chunks)):
+        think_prefix = "\n\n".join(chunks[: i + 1])
+        probs = forcing.letter_probs_first_nonspace(system_prompt, prompt_text, think_prefix)
+        letter_probs.append(probs)
+    return letter_probs
+
+
 def compute_metrics(
     predictions: List[Optional[str]],
     correct_letter: Optional[str],
@@ -478,6 +521,7 @@ def run(
     only_missing_letter_probs: bool = False,
     only_with_critical_chunk: bool = False,
     max_new_tokens: int = 20,
+    fast_backfill: bool = False,
 ):
     """Precompute Forced Solution stability metrics into SQLite.
 
@@ -490,6 +534,42 @@ def run(
     # Connect DB
     conn = sqlite3.connect(sqlite_db)
     ensure_metrics_table(conn)
+
+    if fast_backfill:
+        logger.info("--- Running in FAST BACKFILL mode: updating only letter_probs_json ---")
+        all_rows = fetch_rows(conn, where_model_path, limit, offset)
+
+        cur = conn.cursor()
+        cur.execute("SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE letter_probs_json IS NOT NULL AND letter_probs_json != '[]'")
+        processed_ids = {row[0] for row in cur.fetchall()}
+        
+        initial_count = len(all_rows)
+        rows_to_process = [row for row in all_rows if row.id not in processed_ids]
+        logger.info(f"Filtered {initial_count} rows down to {len(rows_to_process)} for fast backfill.")
+
+        for row in tqdm(rows_to_process, desc="Fast backfilling letter_probs"):
+            think = extract_think_content(row.full_prompt_text)
+            if not think:
+                continue
+            chunks = split_reasoning_chain(think)
+            if not chunks:
+                continue
+
+            prompt_text = compose_user_prompt(row.question_text, row.choices)
+            
+            letter_probs = compute_letter_probs_only(forcing, prompt_text, chunks, system_prompt)
+
+            update_letter_probs_only(
+                conn,
+                trace_id=row.id,
+                model_path=row.model_path,
+                model_name=forcing.model_name,
+                system_prompt=system_prompt,
+                letter_probs=letter_probs,
+            )
+        
+        logger.info("Fast backfill complete.")
+        return 0
 
     # --- Selective Processing Logic ---
     rows = fetch_rows(conn, where_model_path, limit, offset)
