@@ -4,6 +4,10 @@ from typing import Optional
 
 import fire
 import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import os
+import json
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -15,6 +19,7 @@ def run(
     where_model_path: str = "Qwen/Qwen3-32B",
     system_prompt: str = "Answer only with a letter of a correct choice.",
     head_limit: Optional[int] = None,
+    out_dir: str = "analysis_results/stabilization_stability",
 ):
     """
     Analyzes stabilization stability metrics.
@@ -34,7 +39,8 @@ def run(
 
     where_sql = " AND ".join(conds)
     sql = f"""
-        SELECT num_changes, overall_correct
+        SELECT trace_id, num_changes, overall_correct, stabilized_index, num_chunks,
+               continuation_texts_json
         FROM reasoning_trace_forced_solution_metrics
         WHERE {where_sql}
     """
@@ -82,6 +88,71 @@ def run(
         f"({percent_correct_among_zero_changes:.2f}%)"
     )
     print("-" * 40)
+
+    # --- Analysis of relative stabilization position for zero-change examples ---
+    if count_zero_changes > 0:
+        # Calculate relative position, avoiding division by zero
+        df_zero_changes = df_zero_changes.copy()
+        df_zero_changes['relative_pos'] = df_zero_changes.apply(
+            lambda row: row['stabilized_index'] / row['num_chunks'] if row['num_chunks'] > 0 else 0,
+            axis=1
+        )
+
+        print("\n--- Relative Stabilization Position for All Zero-Change Examples ---")
+        print(df_zero_changes['relative_pos'].describe().to_string())
+        print("-" * 60)
+
+        # Plotting the histogram for all zero-change examples
+        os.makedirs(out_dir, exist_ok=True)
+        plt.figure(figsize=(10, 6))
+        sns.histplot(df_zero_changes['relative_pos'], bins=20, kde=True)
+        plt.title('Distribution of Relative Stabilization Position (num_changes = 0)')
+        plt.xlabel('Relative Position (stabilized_index / num_chunks)')
+        plt.ylabel('Frequency')
+        plt.grid(True)
+        
+        plot_filename = f"relative_stabilization_pos_hist_all_{model_name.replace('/', '_')}.png"
+        plot_path = os.path.join(out_dir, plot_filename)
+        plt.savefig(plot_path)
+        logger.info(f"Histogram for all zero-change examples saved to {plot_path}")
+        plt.show()
+
+        # --- Analysis for zero-change examples that did NOT stabilize at index 0 ---
+        df_late_stab = df_zero_changes[df_zero_changes['stabilized_index'] > 0]
+        if not df_late_stab.empty:
+            print("\n--- Relative Stabilization Position for Zero-Change Examples (stabilized_index > 0) ---")
+            print(df_late_stab['relative_pos'].describe().to_string())
+            print("-" * 80)
+
+            plt.figure(figsize=(10, 6))
+            sns.histplot(df_late_stab['relative_pos'], bins=20, kde=True)
+            plt.title('Distribution of Relative Stabilization Position (num_changes = 0 and stabilized_index > 0)')
+            plt.xlabel('Relative Position (stabilized_index / num_chunks)')
+            plt.ylabel('Frequency')
+            plt.grid(True)
+
+            plot_filename_late = f"relative_stabilization_pos_hist_late_{model_name.replace('/', '_')}.png"
+            plot_path_late = os.path.join(out_dir, plot_filename_late)
+            plt.savefig(plot_path_late)
+            logger.info(f"Histogram for late zero-change stabilization saved to {plot_path_late}")
+            plt.show()
+
+            # # --- Print continuation texts for these specific traces ---
+            # print("\n--- Continuation Texts for Late Zero-Change Stabilization Cases ---")
+            # for _, row in df_late_stab.iterrows():
+            #     trace_id = row['trace_id']
+            #     continuations_raw = row['continuation_texts_json']
+            #     try:
+            #         continuations = json.loads(continuations_raw) if continuations_raw else []
+            #         print(f"\nTrace ID: {trace_id} (stabilized at {row['stabilized_index']} / {row['num_chunks']})")
+            #         for i, text in enumerate(continuations):
+            #             print(f"  Chunk {i+1}: {repr(text)}")
+            #     except Exception:
+            #         print(f"\nTrace ID: {trace_id}")
+            #         print(f"  Could not parse continuation_texts_json: {continuations_raw}")
+            # print("-" * 80)
+        else:
+            logger.info("No zero-change examples found that stabilized after index 0.")
 
 
 if __name__ == "__main__":
