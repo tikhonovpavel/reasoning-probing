@@ -37,7 +37,8 @@ def find_first_change_index(predictions: List[Optional[str]]) -> Optional[int]:
 
 
 def run(
-    sqlite_db: str,
+    sqlite_db: str = 'reasoning_traces.sqlite',
+    source_table_name: str = "reasoning_traces_gpqa",
     model_name: str = "Qwen/Qwen3-32B",
     where_model_path: str = "Qwen/Qwen3-32B",
     system_prompt: str = "Answer only with a letter of a correct choice.",
@@ -50,10 +51,12 @@ def run(
     """
     conn = sqlite3.connect(sqlite_db)
     
-    # We need the ground truth correct_answer_letter, so we JOIN with reasoning_traces_qpqa
-    # This assumes `reasoning_traces_qpqa` has columns `id` and `correct_answer_letter`.
-    sql = """
+    # We need the ground truth correct_answer_letter, so we JOIN with the source table
+    # This assumes the source table has columns `id` and `correct_answer_letter`.
+    sql = f"""
     SELECT
+        m.source_table,
+        m.trace_id,
         m.predictions_json,
         m.letter_probs_json,
         m.num_chunks,
@@ -61,14 +64,14 @@ def run(
     FROM
         reasoning_trace_forced_solution_metrics AS m
     JOIN
-        reasoning_traces_qpqa AS t ON m.trace_id = t.id
+        {source_table_name} AS t ON m.trace_id = t.id AND m.source_table = ?
     WHERE
         m.num_changes = 1
         AND m.model_name = ?
         AND m.model_path = ?
         AND m.system_prompt = ?
     """
-    params = [model_name, where_model_path, system_prompt]
+    params = [source_table_name, model_name, where_model_path, system_prompt]
 
     if head_limit:
         sql += f" LIMIT {int(head_limit)}"
@@ -195,7 +198,7 @@ def run(
     plt.xlim(-0.05, 1.05)
     plt.ylim(-0.05, 1.05)
     
-    plot_filename = f"prob_change_scatter_{model_name.replace('/', '_')}.png"
+    plot_filename = f"prob_change_scatter_{source_table_name}_{model_name.replace('/', '_')}.png"
     plot_path = os.path.join(out_dir, plot_filename)
     plt.savefig(plot_path)
     logger.info(f"Scatter plot saved to {plot_path}")
@@ -228,7 +231,7 @@ def run(
     line_handle = Line2D([0], [0], color='k', linestyle='--', alpha=0.7, label='No Change')
     ax.legend(handles=[*patch_handles, line_handle], title='Switch Type', fontsize=11)
 
-    hist_filename = f"prob_change_hist_{model_name.replace('/', '_')}.png"
+    hist_filename = f"prob_change_hist_{source_table_name}_{model_name.replace('/', '_')}.png"
     hist_path = os.path.join(out_dir, hist_filename)
     plt.savefig(hist_path)
     logger.info(f"Histogram saved to {hist_path}")
@@ -244,7 +247,7 @@ def run(
     plt.grid(True)
     plt.xlim(-0.5, 30.5)
     
-    abs_hist_filename = f"critical_index_abs_hist_{model_name.replace('/', '_')}.png"
+    abs_hist_filename = f"critical_index_abs_hist_{source_table_name}_{model_name.replace('/', '_')}.png"
     abs_hist_path = os.path.join(out_dir, abs_hist_filename)
     plt.savefig(abs_hist_path)
     logger.info(f"Absolute index histogram saved to {abs_hist_path}")
@@ -259,7 +262,7 @@ def run(
     plt.xlim(-0.02, 1.02)
     plt.grid(True)
     
-    rel_hist_filename = f"critical_index_rel_hist_{model_name.replace('/', '_')}.png"
+    rel_hist_filename = f"critical_index_rel_hist_{source_table_name}_{model_name.replace('/', '_')}.png"
     rel_hist_path = os.path.join(out_dir, rel_hist_filename)
     plt.savefig(rel_hist_path)
     logger.info(f"Relative index histogram saved to {rel_hist_path}")
@@ -323,7 +326,7 @@ def run(
 
     plt.tight_layout()  # Adjust layout to make space for the legend
 
-    combo_plot_filename = f"prob_change_vs_index_{model_name.replace('/', '_')}.png"
+    combo_plot_filename = f"prob_change_vs_index_{source_table_name}_{model_name.replace('/', '_')}.png"
     combo_plot_path = os.path.join(out_dir, combo_plot_filename)
     plt.savefig(combo_plot_path)
     logger.info(f"Probability change vs. index plot saved to {combo_plot_path}")
@@ -368,7 +371,7 @@ def run(
     ]
     ax.legend(handles=patch_handles, title='Switch Type', fontsize=11)
 
-    remaining_hist_filename = f"chunks_remaining_hist_{model_name.replace('/', '_')}.png"
+    remaining_hist_filename = f"chunks_remaining_hist_{source_table_name}_{model_name.replace('/', '_')}.png"
     remaining_hist_path = os.path.join(out_dir, remaining_hist_filename)
     plt.savefig(remaining_hist_path)
     logger.info(f"Chunks remaining histogram saved to {remaining_hist_path}")

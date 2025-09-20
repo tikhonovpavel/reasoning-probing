@@ -9,6 +9,8 @@ from gpqa_dataset import GPQADataset
 import time
 import requests
 import concurrent.futures
+from logiqa_dataset import LogiqaDataset
+import traceback
 
 def setup_database(db_path: str, table_name: str):
     """Initializes the database and creates the specified table if it doesn't exist."""
@@ -59,6 +61,7 @@ def process_item(args):
     if not with_reasoning:
         payload["reasoning"] = {"max_tokens": 1}
 
+    response = None
     while retries < max_retries:
         try:
             response = requests.post(url, headers=headers, data=json.dumps(payload), timeout=180)
@@ -116,8 +119,25 @@ def process_item(args):
                 "is_correct": is_correct,
             }
         
-        except (requests.RequestException, json.JSONDecodeError) as e:
-            print(f"Request failed: {e}")
+        except json.JSONDecodeError as e:
+            print(f"\n--- ERROR: Failed to decode JSON response from OpenRouter ---")
+            print(f"Error: {e}")
+            if response is not None:
+                print(f"Response Status Code: {response.status_code}")
+                print(f"Response Body (first 500 chars):\n{response.text[:500]}")
+            print("------------------------------------------------------------")
+            retries += 1
+            time.sleep(5)
+        
+        except requests.RequestException as e:
+            print(f"\n--- ERROR: Request to OpenRouter failed (Network/HTTP Error) ---")
+            print(f"Error: {e}")
+            if response is not None:
+                print(f"Response Status Code: {response.status_code}")
+                print(f"Response Body (first 500 chars):\n{response.text[:500]}")
+            print("Full Traceback:")
+            traceback.print_exc()
+            print("------------------------------------------------------------")
             retries += 1
             time.sleep(5)
 
@@ -127,11 +147,13 @@ def process_item(args):
 
 def main(
     model_name: str = "Qwen/Qwen3-32B",
+    dataset_name: str = "gpqa",
     dataset_config: str = "gpqa_diamond",
     dataset_split: str = "train",
     db_path: str = "reasoning_traces.sqlite",
     with_reasoning: bool = True,
     include_no_think_instruction: bool = True,
+    num_samples: int = -1,
 ):
     """
     Runs inference on the GPQA dataset using the OpenRouter API with multiple threads,
@@ -146,13 +168,20 @@ def main(
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     # Load dataset
-    dataset = GPQADataset(config_name=dataset_config, split=dataset_split)
+    if dataset_name == "gpqa":
+        dataset = GPQADataset(config_name=dataset_config, split=dataset_split)
+        table_base_name = "reasoning_traces_gpqa"
+    elif dataset_name == "logiqa":
+        dataset = LogiqaDataset(split=dataset_split)
+        table_base_name = "reasoning_traces_logiqa"
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
 
     # Setup database
     if with_reasoning:
-        table_name = "reasoning_traces_qpqa"
+        table_name = table_base_name
     else:
-        table_name = "reasoning_traces_qpqa_no_reasoning"
+        table_name = f"{table_base_name}_no_reasoning"
     
     conn = setup_database(db_path, table_name)
     cursor = conn.cursor()
@@ -161,8 +190,13 @@ def main(
     cursor.execute(f"SELECT question_text FROM {table_name} WHERE model_path = ?", (model_name,))
     processed_texts = {row[0] for row in cursor.fetchall()}
     
+    total_samples_to_consider = len(dataset)
+    if num_samples > 0:
+        total_samples_to_consider = min(num_samples, len(dataset))
+        print(f"Limiting processing to the first {total_samples_to_consider} samples.")
+
     indices_to_process = []
-    for i in range(len(dataset)):
+    for i in range(total_samples_to_consider):
         if dataset[i]["question"] not in processed_texts:
             indices_to_process.append(i)
 

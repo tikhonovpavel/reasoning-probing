@@ -14,7 +14,8 @@ logger = logging.getLogger(__name__)
 
 
 def run(
-    sqlite_db: str,
+    sqlite_db: str = 'reasoning_traces.sqlite',
+    source_table_name: str = "reasoning_traces_gpqa",
     model_name: str = "Qwen/Qwen3-32B",
     where_model_path: str = "Qwen/Qwen3-32B",
     system_prompt: str = "Answer only with a letter of a correct choice.",
@@ -29,12 +30,13 @@ def run(
     conn = sqlite3.connect(sqlite_db)
     
     conds = [
+        "source_table = ?",
         "stabilized_index IS NOT NULL",
         "model_name = ?",
         "model_path = ?",
         "system_prompt = ?",
     ]
-    params = [model_name, where_model_path, system_prompt]
+    params = [source_table_name, model_name, where_model_path, system_prompt]
 
     where_sql = " AND ".join(conds)
     sql = f"""
@@ -227,7 +229,7 @@ def run(
     plt.legend(title='Num Changes', bbox_to_anchor=(1.02, 1), loc='upper left')
     plt.tight_layout()
 
-    plot_filename = f"binned_accuracy_vs_length_by_changes_{model_name.replace('/', '_')}.png"
+    plot_filename = f"binned_accuracy_vs_length_by_changes_{source_table_name}_{model_name.replace('/', '_')}.png"
     plot_path = os.path.join(out_dir, plot_filename)
     plt.savefig(plot_path)
     logger.info(f"Binned plot saved to {plot_path}")

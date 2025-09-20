@@ -52,6 +52,7 @@ def ensure_metrics_table(conn: sqlite3.Connection):
         """
         CREATE TABLE IF NOT EXISTS reasoning_trace_forced_solution_metrics (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_table TEXT NOT NULL,
             trace_id INTEGER NOT NULL,
             model_path TEXT NOT NULL,
             model_name TEXT NOT NULL,
@@ -69,24 +70,16 @@ def ensure_metrics_table(conn: sqlite3.Connection):
             correct_at_first_chunk INTEGER NOT NULL,
             overall_correct INTEGER NOT NULL,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            UNIQUE(trace_id, model_path, model_name, system_prompt)
+            UNIQUE(source_table, trace_id, model_path, model_name, system_prompt)
         )
         """
     )
-    # Best-effort migration: add missing columns with sane defaults
-    cur.execute("PRAGMA table_info(reasoning_trace_forced_solution_metrics)")
-    cols = {row[1] for row in cur.fetchall()}
-    if "continuation_texts_json" not in cols:
-        cur.execute("ALTER TABLE reasoning_trace_forced_solution_metrics ADD COLUMN continuation_texts_json TEXT NOT NULL DEFAULT '[]'")
-    if "token_confidences_json" not in cols:
-        cur.execute("ALTER TABLE reasoning_trace_forced_solution_metrics ADD COLUMN token_confidences_json TEXT NOT NULL DEFAULT '[]'")
-    if "letter_probs_json" not in cols:
-        cur.execute("ALTER TABLE reasoning_trace_forced_solution_metrics ADD COLUMN letter_probs_json TEXT NOT NULL DEFAULT '[]'")
     conn.commit()
 
 
 def fetch_rows(
     conn: sqlite3.Connection,
+    source_table_name: str,
     where_model_path: Optional[str],
     limit: Optional[int],
     offset: int,
@@ -100,7 +93,7 @@ def fetch_rows(
     sql = f"""
         SELECT id, model_path, question_id, question_text, choices, correct_answer_letter,
                full_prompt_text
-        FROM reasoning_traces_qpqa
+        FROM {source_table_name}
         {where_clause}
         ORDER BY id ASC
         LIMIT {limit if limit is not None else -1} OFFSET {offset}
@@ -123,16 +116,16 @@ def fetch_rows(
 
 
 def has_existing_metrics(
-    conn: sqlite3.Connection, trace_id: int, model_path: str, model_name: str, system_prompt: str
+    conn: sqlite3.Connection, source_table: str, trace_id: int, model_path: str, model_name: str, system_prompt: str
 ) -> bool:
     cur = conn.cursor()
     cur.execute(
         """
         SELECT 1 FROM reasoning_trace_forced_solution_metrics
-        WHERE trace_id = ? AND model_path = ? AND model_name = ? AND system_prompt = ?
+        WHERE source_table = ? AND trace_id = ? AND model_path = ? AND model_name = ? AND system_prompt = ?
         LIMIT 1
         """,
-        (trace_id, model_path, model_name, system_prompt),
+        (source_table, trace_id, model_path, model_name, system_prompt),
     )
     return cur.fetchone() is not None
 
@@ -140,6 +133,7 @@ def has_existing_metrics(
 def upsert_metrics(
     conn: sqlite3.Connection,
     *,
+    source_table: str,
     trace_id: int,
     model_path: str,
     model_name: str,
@@ -161,13 +155,13 @@ def upsert_metrics(
     cur.execute(
         """
         INSERT INTO reasoning_trace_forced_solution_metrics (
-            trace_id, model_path, model_name, system_prompt, num_chunks, predictions_json,
+            source_table, trace_id, model_path, model_name, system_prompt, num_chunks, predictions_json,
             continuation_texts_json, token_confidences_json,
             letter_probs_json,
             first_prediction_index, first_correct_index, stabilized_index, stabilized_value,
             num_changes, correct_at_first_chunk, overall_correct, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(trace_id, model_path, model_name, system_prompt)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(source_table, trace_id, model_path, model_name, system_prompt)
         DO UPDATE SET
             num_chunks = excluded.num_chunks,
             predictions_json = excluded.predictions_json,
@@ -184,6 +178,7 @@ def upsert_metrics(
             created_at = excluded.created_at
         """,
         (
+            source_table,
             trace_id,
             model_path,
             model_name,
@@ -209,6 +204,7 @@ def upsert_metrics(
 def update_letter_probs_only(
     conn: sqlite3.Connection,
     *,
+    source_table: str,
     trace_id: int,
     model_path: str,
     model_name: str,
@@ -221,10 +217,11 @@ def update_letter_probs_only(
         """
         UPDATE reasoning_trace_forced_solution_metrics
         SET letter_probs_json = ?
-        WHERE trace_id = ? AND model_path = ? AND model_name = ? AND system_prompt = ?
+        WHERE source_table = ? AND trace_id = ? AND model_path = ? AND model_name = ? AND system_prompt = ?
         """,
         (
             json.dumps(letter_probs),
+            source_table,
             trace_id,
             model_path,
             model_name,
@@ -510,7 +507,8 @@ def compute_metrics(
 # Fire CLI entrypoint
 # ----------------------------------------------------------------------------
 def run(
-    sqlite_db: str,
+    sqlite_db: str = "reasoning_traces.sqlite",
+    source_table_name: str = "reasoning_traces_gpqa",
     where_model_path: str = "Qwen/Qwen3-32B",
     model_name: str = "Qwen/Qwen3-32B",
     system_prompt: str = "Answer only with a letter of a correct choice.",
@@ -536,12 +534,12 @@ def run(
 
     if fast_backfill:
         logger.info("--- Running in FAST BACKFILL mode: updating only letter_probs_json ---")
-        all_rows = fetch_rows(conn, where_model_path, limit, offset)
+        all_rows = fetch_rows(conn, source_table_name, where_model_path, limit, offset)
 
         cur = conn.cursor()
         # Find rows that have actual data, not just empty placeholders like '[{}, {}]'
-        sql = "SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE letter_probs_json LIKE '%\"A\"%' AND model_name = ? AND model_path = ? AND system_prompt = ?"
-        params = (forcing.model_name, where_model_path, system_prompt)
+        sql = "SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE letter_probs_json LIKE '%\"A\"%' AND source_table = ? AND model_name = ? AND model_path = ? AND system_prompt = ?"
+        params = (source_table_name, forcing.model_name, where_model_path, system_prompt)
         cur.execute(sql, params)
         processed_ids = {row[0] for row in cur.fetchall()}
         
@@ -563,6 +561,7 @@ def run(
 
             update_letter_probs_only(
                 conn,
+                source_table=source_table_name,
                 trace_id=row.id,
                 model_path=row.model_path,
                 model_name=forcing.model_name,
@@ -574,7 +573,7 @@ def run(
         return 0
 
     # --- Selective Processing Logic ---
-    rows = fetch_rows(conn, where_model_path, limit, offset)
+    rows = fetch_rows(conn, source_table_name, where_model_path, limit, offset)
     if not rows:
         logger.info("No rows found")
         return 0
@@ -588,8 +587,8 @@ def run(
         if only_missing_letter_probs:
             cur = conn.cursor()
             # Find rows that have actual data, not just empty placeholders like '[{}, {}]'
-            sql = "SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE letter_probs_json LIKE '%\"A\"%' AND model_name = ? AND model_path = ? AND system_prompt = ?"
-            params = (forcing.model_name, where_model_path, system_prompt)
+            sql = "SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE letter_probs_json LIKE '%\"A\"%' AND source_table = ? AND model_name = ? AND model_path = ? AND system_prompt = ?"
+            params = (source_table_name, forcing.model_name, where_model_path, system_prompt)
             cur.execute(sql, params)
             processed_ids = {row[0] for row in cur.fetchall()}
             logger.info(f"Found {len(processed_ids)} rows with existing letter_probs, will filter them out.")
@@ -599,7 +598,7 @@ def run(
         if only_with_critical_chunk:
             cur = conn.cursor()
             # A "critical chunk" exists if the first correct answer was not on the first chunk
-            cur.execute("SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE first_correct_index IS NOT NULL AND first_correct_index > 0")
+            cur.execute("SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE first_correct_index IS NOT NULL AND first_correct_index > 0 AND source_table = ?", (source_table_name,))
             critical_ids = {row[0] for row in cur.fetchall()}
             logger.info(f"Found {len(critical_ids)} rows with a critical chunk. Filtering to process only these.")
 
@@ -640,6 +639,7 @@ def run(
 
         upsert_metrics(
             conn,
+            source_table=source_table_name,
             trace_id=row.id,
             model_path=row.model_path,
             model_name=forcing.model_name,
