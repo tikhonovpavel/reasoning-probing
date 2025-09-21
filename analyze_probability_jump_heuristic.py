@@ -84,25 +84,34 @@ def run(
     conn = sqlite3.connect(sqlite_db)
 
     conds = [
-        "source_table = ?",
-        "stabilized_index IS NOT NULL",
-        "model_name = ?",
-        "model_path = ?",
-        "system_prompt = ?",
+        "m.source_table = ?",
+        "m.stabilized_index IS NOT NULL",
+        "m.model_name = ?",
+        "m.model_path = ?",
+        "m.system_prompt = ?",
     ]
     params = [source_table_name, model_name, where_model_path, system_prompt]
 
     where_sql = " AND ".join(conds)
     sql = f"""
-        SELECT letter_probs_json, stabilized_value, num_chunks, continuation_texts_json, overall_correct
-        FROM reasoning_trace_forced_solution_metrics
+        SELECT 
+            m.letter_probs_json, 
+            m.stabilized_value, 
+            m.num_chunks, 
+            m.overall_correct, 
+            m.predictions_json,
+            t.full_prompt_text
+        FROM reasoning_trace_forced_solution_metrics as m
+        JOIN {source_table_name} AS t ON m.trace_id = t.id AND m.source_table = ?
         WHERE {where_sql}
     """
+    # The first parameter in `params` is for the JOIN condition, the rest are for the WHERE clause
+    sql_params = [source_table_name] + params
     if head_limit:
         sql += f" LIMIT {int(head_limit)}"
 
     try:
-        df = pd.read_sql_query(sql, conn, params=params)
+        df = pd.read_sql_query(sql, conn, params=sql_params)
     finally:
         conn.close()
 
@@ -111,7 +120,7 @@ def run(
         return
 
     df['letter_probs'] = df['letter_probs_json'].apply(lambda x: parse_json_safe(x, []))
-    df['continuation_texts'] = df['continuation_texts_json'].apply(lambda x: parse_json_safe(x, []))
+    df['predictions'] = df['predictions_json'].apply(lambda x: parse_json_safe(x, []))
     df = df.dropna(subset=['stabilized_value'])
 
     thresholds = np.arange(threshold_step, 1.0, threshold_step)
@@ -156,11 +165,35 @@ def run(
 
         # Calculate savings in tokens
         def calculate_token_saving(row):
-            saved_texts = row['continuation_texts'][int(row['k_stop']) + 1:]
-            if not saved_texts:
+            # This is the "ideal world" calculation as requested.
+            # We fetch the original reasoning text, split it into chunks,
+            # and then tokenize the chunks that were skipped by the heuristic.
+            full_text = row.get('full_prompt_text')
+            if not full_text:
                 return 0
-            # Tokenize all saved chunks together for efficiency
-            return len(tokenizer.encode(" ".join(saved_texts)))
+
+            # Import helper functions locally to avoid top-level dependency
+            from rc_utils import extract_think_content, split_reasoning_chain
+
+            think_content = extract_think_content(full_text)
+            if not think_content:
+                return 0
+
+            chunks = split_reasoning_chain(think_content)
+            if not chunks:
+                return 0
+            
+            k_stop = int(row['k_stop'])
+            if k_stop + 1 >= len(chunks):
+                return 0 # Heuristic triggered on the last chunk, no savings
+
+            saved_chunks = chunks[k_stop + 1:]
+            
+            if not saved_chunks:
+                return 0
+            
+            # We tokenize the actual text of the reasoning chunks that were skipped.
+            return len(tokenizer.encode("\n\n".join(saved_chunks)))
 
         triggered_df['token_saving'] = triggered_df.apply(calculate_token_saving, axis=1)
         avg_token_saving = triggered_df['token_saving'].mean()

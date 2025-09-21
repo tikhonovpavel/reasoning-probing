@@ -88,7 +88,7 @@ def fetch_rows(
     params: List[object] = []
     where_clause = ""
     if where_model_path:
-        where_clause = "WHERE model_path = ?"
+        where_clause = "WHERE LOWER(model_path) = LOWER(?)"
         params.append(where_model_path)
     sql = f"""
         SELECT id, model_path, question_id, question_text, choices, correct_answer_letter,
@@ -122,7 +122,7 @@ def has_existing_metrics(
     cur.execute(
         """
         SELECT 1 FROM reasoning_trace_forced_solution_metrics
-        WHERE source_table = ? AND trace_id = ? AND model_path = ? AND model_name = ? AND system_prompt = ?
+        WHERE source_table = ? AND trace_id = ? AND LOWER(model_path) = LOWER(?) AND LOWER(model_name) = LOWER(?) AND system_prompt = ?
         LIMIT 1
         """,
         (source_table, trace_id, model_path, model_name, system_prompt),
@@ -217,7 +217,7 @@ def update_letter_probs_only(
         """
         UPDATE reasoning_trace_forced_solution_metrics
         SET letter_probs_json = ?
-        WHERE source_table = ? AND trace_id = ? AND model_path = ? AND model_name = ? AND system_prompt = ?
+        WHERE source_table = ? AND trace_id = ? AND LOWER(model_path) = LOWER(?) AND LOWER(model_name) = LOWER(?) AND system_prompt = ?
         """,
         (
             json.dumps(letter_probs),
@@ -243,11 +243,19 @@ class Qwen3Forcing:
     def __init__(self, model_name: str, device_map: str = "auto"):
         logger.info("Loading model: %s", model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if self.tokenizer.pad_token_id is None:
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+        # self.model_name = model_name
+        # self.model = None
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             device_map=device_map,
             dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32,
         )
+        if self.model.config.pad_token_id is None:
+            self.model.config.pad_token_id = self.tokenizer.pad_token_id
+
         self.model_name = model_name
         self.device = self.model.device
         logger.info("Model loaded")
@@ -284,6 +292,11 @@ class Qwen3Forcing:
             add_generation_prompt=True,
         )
         templated = header + f"<think>\n{think_content}{QWEN3_SPECIAL_STOPPING_PROMPT}"
+        
+        if self.model_name == "deepseek-ai/DeepSeek-R1-Distill-Llama-70B":
+            templated = templated.replace(  # it is because LLama tokenier adds <think> tag by itself
+                '<think>\n<think>', '<think>'
+            )
 
         inputs = self.tokenizer(templated, return_tensors="pt").to(self.device)
         gen_out = self.model.generate(
@@ -334,6 +347,13 @@ class Qwen3Forcing:
             add_generation_prompt=True,
         )
         templated = header + f"<think>\n{think_prefix}{QWEN3_SPECIAL_STOPPING_PROMPT}"
+        
+        if self.model_name == "deepseek-ai/DeepSeek-R1-Distill-Llama-70B":
+            templated = templated.replace(  # it is because LLama tokenier adds <think> tag by itself
+                '<think>\n<think>', '<think>'
+            )
+            
+            templated += '\\boxed{'
 
         inputs = self.tokenizer(templated, return_tensors="pt").to(self.device)
         outputs = self.model(**inputs)
@@ -349,37 +369,38 @@ class Qwen3Forcing:
                 continue
             direct[letter] = max(float(probs[i].item()) for i in ids)
 
-        # Identify whitespace candidates among top-K next tokens
-        top_vals, top_ids = torch.topk(probs, k=min(topk_probe, probs.shape[-1]))
-        whitespace_ids: List[Tuple[int, float]] = []
-        for val, tid in zip(top_vals.tolist(), top_ids.tolist()):
-            text = self.tokenizer.decode([tid])
-            if text != "" and text.isspace():
-                whitespace_ids.append((tid, float(val)))
-            if len(whitespace_ids) >= whitespace_topk:
-                break
-
-        # Marginalize over whitespace candidates
-        contrib = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
-        if whitespace_ids:
-            base_ids = inputs["input_ids"]
-            for tid, p_s in whitespace_ids:
-                new_id_tensor = torch.tensor([[tid]], dtype=base_ids.dtype, device=self.device)
-                concat = torch.cat([base_ids, new_id_tensor], dim=1)
-                attn = torch.ones_like(concat)
-                out2 = self.model(input_ids=concat, attention_mask=attn)
-                logits2 = out2.logits[0, -1]
-                probs2 = torch.softmax(logits2.float(), dim=-1)
-                for letter, ids in self.letter_to_token_ids.items():
-                    if not ids:
-                        continue
-                    p2 = max(float(probs2[i].item()) for i in ids)
-                    contrib[letter] += p_s * p2
-
-        out = {}
-        for letter in ["A", "B", "C", "D"]:
-            out[letter] = min(1.0, direct.get(letter, 0.0) + contrib.get(letter, 0.0))
-        return out
+        # # Identify whitespace candidates among top-K next tokens
+        # top_vals, top_ids = torch.topk(probs, k=min(topk_probe, probs.shape[-1]))
+        # whitespace_ids: List[Tuple[int, float]] = []
+        # for val, tid in zip(top_vals.tolist(), top_ids.tolist()):
+        #     text = self.tokenizer.decode([tid])
+        #     if text != "" and text.isspace():
+        #         whitespace_ids.append((tid, float(val)))
+        #     if len(whitespace_ids) >= whitespace_topk:
+        #         break
+        #
+        # # Marginalize over whitespace candidates
+        # contrib = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0}
+        # if whitespace_ids:
+        #     base_ids = inputs["input_ids"]
+        #     for tid, p_s in whitespace_ids:
+        #         new_id_tensor = torch.tensor([[tid]], dtype=base_ids.dtype, device=self.device)
+        #         concat = torch.cat([base_ids, new_id_tensor], dim=1)
+        #         attn = torch.ones_like(concat)
+        #         out2 = self.model(input_ids=concat, attention_mask=attn)
+        #         logits2 = out2.logits[0, -1]
+        #         probs2 = torch.softmax(logits2.float(), dim=-1)
+        #         for letter, ids in self.letter_to_token_ids.items():
+        #             if not ids:
+        #                 continue
+        #             p2 = max(float(probs2[i].item()) for i in ids)
+        #             contrib[letter] += p_s * p2
+        #
+        # out = {}
+        # for letter in ["A", "B", "C", "D"]:
+        #     out[letter] = min(1.0, direct.get(letter, 0.0) + contrib.get(letter, 0.0))
+        # return out
+        return direct
 
 
 LETTER_RE = re.compile(r"\b([A-Da-d])\b")
@@ -407,22 +428,34 @@ def compute_predictions_per_prefix(
     letter_probs: List[Dict[str, float]] = []
     for i in range(len(chunks)):
         think_prefix = "\n\n".join(chunks[: i + 1])
-        forced = forcing.forced_solution(prompt_text, think_prefix, system_prompt, max_new_tokens)
-        if forced is None:
-            continuations.append("")
-            confidences.append([])
-            predictions.append(None)
-            letter_probs.append({})
-            continue
-        cont_text, token_probs = forced
-        letter = extract_letter(cont_text)
-        predictions.append(letter)
-        continuations.append(cont_text)
-        confidences.append(token_probs)
+        # forced = forcing.forced_solution(prompt_text, think_prefix, system_prompt, max_new_tokens)
+        # if forced is None:
+        #     continuations.append("")
+        #     confidences.append([])
+        #     predictions.append(None)
+        #     letter_probs.append({})
+        #     continue
+        # cont_text, token_probs = forced
+        # letter = extract_letter(cont_text)
+        # predictions.append(letter)
+        # continuations.append(cont_text)
+        # confidences.append(token_probs)
+
+        # Per user request, continuation generation is disabled.
+        # Instead, we derive predictions by taking the argmax of letter probabilities.
+        continuations.append("")
+        confidences.append([])
 
         # Also compute letter probabilities
         probs = forcing.letter_probs_first_nonspace(system_prompt, prompt_text, think_prefix)
         letter_probs.append(probs)
+
+        # Derive prediction from argmax of probabilities
+        if probs:
+            prediction = max(probs, key=probs.get)
+            predictions.append(prediction)
+        else:
+            predictions.append(None)
 
     return predictions, continuations, confidences, letter_probs
 
@@ -509,8 +542,8 @@ def compute_metrics(
 def run(
     sqlite_db: str = "reasoning_traces.sqlite",
     source_table_name: str = "reasoning_traces_gpqa",
-    where_model_path: str = "Qwen/Qwen3-32B",
-    model_name: str = "Qwen/Qwen3-32B",
+    where_model_path: str = "deepseek/DeepSeek-R1-Distill-Llama-70B", #"Qwen/Qwen3-32B",
+    model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B", #"Qwen/Qwen3-32B",
     system_prompt: str = "Answer only with a letter of a correct choice.",
     limit: Optional[int] = None,
     offset: int = 0,
@@ -519,32 +552,61 @@ def run(
     max_new_tokens: int = 20,
     fast_backfill: bool = False,
     device_map: str = "auto",
+    skip_existing: bool = True,
 ):
     """Precompute Forced Solution stability metrics into SQLite.
 
     Args mirror the former argparse flags. Use underscores in CLI: e.g., --only_missing.
     """
 
-    # Load model
-    forcing = Qwen3Forcing(model_name, device_map=device_map)
-
-    # Connect DB
+    # --- DB Connection and Initial Fetch ---
     conn = sqlite3.connect(sqlite_db)
     ensure_metrics_table(conn)
 
+    logger.info("Checking database for rows to process...")
+    rows = fetch_rows(conn, source_table_name, where_model_path, limit, offset)
+
+    if not rows:
+        logger.info("No rows found matching the criteria. Exiting.")
+        return 0
+
+    if skip_existing:
+        initial_count = len(rows)
+        cur = conn.cursor()
+        sql = "SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE source_table = ? AND LOWER(model_name) = LOWER(?) AND LOWER(model_path) = LOWER(?) AND system_prompt = ?"
+        params = (source_table_name, model_name, where_model_path, system_prompt)
+        cur.execute(sql, params)
+        processed_ids = {row[0] for row in cur.fetchall()}
+        
+        if processed_ids:
+            logger.info(f"Found {len(processed_ids)} existing metrics. Will skip them.")
+            rows = [row for row in rows if row.id not in processed_ids]
+            logger.info(f"Filtered {initial_count} rows down to {len(rows)} for processing.")
+
+    if not rows:
+        logger.info("No rows to process after filtering for existing metrics. Exiting.")
+        return 0
+
+    # --- Conditional Model Loading ---
+    logger.info(f"{len(rows)} rows found. Now loading model: %s", model_name)
+    forcing = Qwen3Forcing(model_name, device_map=device_map)
+
+    # Note: `model_name` used in DB queries before this point is the one from args.
+    # Now we use `forcing.model_name` which is the canonical one after loading.
+    # This is fine as we use LOWER() for comparison.
+    
     if fast_backfill:
         logger.info("--- Running in FAST BACKFILL mode: updating only letter_probs_json ---")
-        all_rows = fetch_rows(conn, source_table_name, where_model_path, limit, offset)
-
+        
         cur = conn.cursor()
         # Find rows that have actual data, not just empty placeholders like '[{}, {}]'
-        sql = "SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE letter_probs_json LIKE '%\"A\"%' AND source_table = ? AND model_name = ? AND model_path = ? AND system_prompt = ?"
+        sql = "SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE letter_probs_json LIKE '%\"A\"%' AND source_table = ? AND LOWER(model_name) = LOWER(?) AND LOWER(model_path) = LOWER(?) AND system_prompt = ?"
         params = (source_table_name, forcing.model_name, where_model_path, system_prompt)
         cur.execute(sql, params)
         processed_ids = {row[0] for row in cur.fetchall()}
         
-        initial_count = len(all_rows)
-        rows_to_process = [row for row in all_rows if row.id not in processed_ids]
+        initial_count = len(rows)
+        rows_to_process = [row for row in rows if row.id not in processed_ids]
         logger.info(f"Filtered {initial_count} rows down to {len(rows_to_process)} for fast backfill.")
 
         for row in tqdm(rows_to_process, desc="Fast backfilling letter_probs"):
@@ -573,11 +635,8 @@ def run(
         return 0
 
     # --- Selective Processing Logic ---
-    rows = fetch_rows(conn, source_table_name, where_model_path, limit, offset)
-    if not rows:
-        logger.info("No rows found")
-        return 0
-
+    # `rows` is already fetched and filtered by `skip_existing`
+    
     # Filter rows *before* processing, so tqdm shows the correct total.
     if only_missing_letter_probs or only_with_critical_chunk:
         initial_count = len(rows)
@@ -587,7 +646,7 @@ def run(
         if only_missing_letter_probs:
             cur = conn.cursor()
             # Find rows that have actual data, not just empty placeholders like '[{}, {}]'
-            sql = "SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE letter_probs_json LIKE '%\"A\"%' AND source_table = ? AND model_name = ? AND model_path = ? AND system_prompt = ?"
+            sql = "SELECT trace_id FROM reasoning_trace_forced_solution_metrics WHERE letter_probs_json LIKE '%\"A\"%' AND source_table = ? AND LOWER(model_name) = LOWER(?) AND LOWER(model_path) = LOWER(?) AND system_prompt = ?"
             params = (source_table_name, forcing.model_name, where_model_path, system_prompt)
             cur.execute(sql, params)
             processed_ids = {row[0] for row in cur.fetchall()}
@@ -625,6 +684,10 @@ def run(
 
         chunks = split_reasoning_chain(think)
         if not chunks:
+            continue
+
+        # Limit processing to traces with fewer than 40 chunks to manage performance.
+        if len(chunks) >= 40:
             continue
 
         prompt_text = compose_user_prompt(row.question_text, row.choices)

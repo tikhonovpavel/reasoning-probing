@@ -78,26 +78,51 @@ def process_item(args):
                 retries += 1
                 time.sleep(2) # Wait a bit before retrying
                 continue
-            assistant_content = f"<think>\n{reasoning}\n</think>\n{final_answer}"
+            
+            
+            if 'Qwen3' in model_name:
+                assistant_content = f"<think>\n{reasoning}\n</think>\n{final_answer}"
 
-            # Construct the full conversation and apply the chat template
-            full_conversation = [
-                {"role": "user", "content": item['prompt']},
-                {"role": "assistant", "content": assistant_content},
-            ]
+                # Construct the full conversation and apply the chat template
+                full_conversation = [
+                    {"role": "user", "content": item['prompt']},
+                    {"role": "assistant", "content": assistant_content},
+                ]
 
-            if include_no_think_instruction:
-                full_conversation.insert(0, {"role": "system", "content": "Respond only with the letter of the correct option. Don't write any explanations"})
+                if include_no_think_instruction:
+                    full_conversation.insert(0, {"role": "system", "content": "Respond only with the letter of the correct option. Don't write any explanations"})
 
-            full_text = tokenizer.apply_chat_template(
-                full_conversation,
-                tokenize=False,
-                add_generation_prompt=False
-            )
-            if with_reasoning:
-                full_text = full_text.replace(
-                    '<think>\n\n</think>\n\n<think>', '<think>'
+                full_text = tokenizer.apply_chat_template(
+                    full_conversation,
+                    tokenize=False,
+                    add_generation_prompt=False
                 )
+                if with_reasoning:
+                    full_text = full_text.replace(
+                        '<think>\n\n</think>\n\n<think>', '<think>'
+                    )
+
+            elif 'deepseek/' in model_name:
+                assistant_content = f"<think>\n{reasoning}\n</THINK>\n{final_answer}"
+
+                # Construct the full conversation and apply the chat template
+                full_conversation = [
+                    {"role": "user", "content": item['prompt']},
+                    {"role": "assistant", "content": assistant_content},
+                ]
+
+                if include_no_think_instruction:
+                    full_conversation.insert(0, {"role": "system", "content": "Respond only with the letter of the correct option. Don't write any explanations"})
+
+                full_text = tokenizer.apply_chat_template(
+                    full_conversation,
+                    tokenize=False,
+                    add_generation_prompt=False
+                )
+                if with_reasoning:
+                    full_text = full_text.replace(
+                        '</THINK>', '</think>'
+                    )
 
             # Extract the letter from the final answer
             matches = re.findall(r'[A-D]', final_answer)
@@ -146,9 +171,9 @@ def process_item(args):
 
 
 def main(
-    model_name: str = "Qwen/Qwen3-32B",
+    model_name: str = "deepseek/deepseek-r1-distill-llama-70b", #"Qwen/Qwen3-32B",
     dataset_name: str = "gpqa",
-    dataset_config: str = "gpqa_diamond",
+    dataset_config: str = "gpqa_main",
     dataset_split: str = "train",
     db_path: str = "reasoning_traces.sqlite",
     with_reasoning: bool = True,
@@ -165,7 +190,7 @@ def main(
         return
 
     # Load tokenizer to correctly format the final prompt string
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name.replace('deepseek/', 'deepseek-ai/'))
 
     # Load dataset
     if dataset_name == "gpqa":

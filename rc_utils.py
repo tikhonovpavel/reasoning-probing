@@ -5,7 +5,7 @@ from typing import List, Optional
 
 # Shared constant used for Qwen3 forced-solution prompting
 QWEN3_SPECIAL_STOPPING_PROMPT = (
-    "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>"
+    "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n</think>\n"
 )
 
 

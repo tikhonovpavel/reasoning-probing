@@ -1,0 +1,23 @@
+-- database: ./reasoning_traces.sqlite
+
+SELECT model_path, COUNT(*), AVG(is_correct) FROM reasoning_traces_gpqa
+GROUP BY `model_path`;
+
+
+
+
+
+SELECT model_path, COUNT(*), AVG(is_correct) FROM reasoning_traces_logiqa
+GROUP BY `model_path`;
+
+
+select model_path, source_table, COUNT(*), AVG(overall_correct) from reasoning_trace_forced_solution_metrics GROUP BY `model_path`, `source_table`;
+
+
+
+
+
+
+select  letter_probs_json from reasoning_trace_forced_solution_metrics WHERE LOWER(model_path) = LOWER('deepseek/DeepSeek-R1-Distill-Llama-70B');
+
+select model_path, COUNT(*), AVG(overall_correct) FROM reasoning_trace_forced_solution_metrics GROUP BY `model_path`;
