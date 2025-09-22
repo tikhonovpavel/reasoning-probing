@@ -234,12 +234,25 @@ def update_letter_probs_only(
 # ----------------------------------------------------------------------------
 # Text Utilities are imported from rc_utils
 # ----------------------------------------------------------------------------
+def extract_think_content_for_row(row: RowItem) -> Optional[str]:
+    """Extracts reasoning/think content based on the model path."""
+    # model_path can be None in some database schemas
+    model_path = row.model_path or ""
+    if 'gpt-oss-20b' in model_path.lower():
+        # OSS model uses <|start|>analysis<|message|>...<|end|>
+        match = re.search(r"<\|start\|>analysis<\|message\|>(.*?)(<\|end\|>)", row.full_prompt_text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return None
+    else:
+        # Default to Qwen/Deepseek <think>...</think>
+        return extract_think_content(row.full_prompt_text)
 
 
 # ----------------------------------------------------------------------------
 # Model Wrapper
 # ----------------------------------------------------------------------------
-class Qwen3Forcing:
+class ModelForcing:
     def __init__(self, model_name: str, device_map: str = "auto"):
         logger.info("Loading model: %s", model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -291,12 +304,16 @@ class Qwen3Forcing:
             tokenize=False,
             add_generation_prompt=True,
         )
-        templated = header + f"<think>\n{think_content}{QWEN3_SPECIAL_STOPPING_PROMPT}"
-        
-        if self.model_name == "deepseek-ai/DeepSeek-R1-Distill-Llama-70B":
-            templated = templated.replace(  # it is because LLama tokenier adds <think> tag by itself
-                '<think>\n<think>', '<think>'
-            )
+
+        if 'gpt-oss-20b' in self.model_name.lower():
+            templated = header + f"<|start|>analysis<|message|>{think_content}<|end|><|start|>final<|message|>"
+        else:
+            # Default logic for Qwen/Deepseek
+            templated = header + f"<think>\n{think_content}{QWEN3_SPECIAL_STOPPING_PROMPT}"
+            if "deepseek" in self.model_name.lower():
+                templated = templated.replace(
+                    '<think>\n<think>', '<think>'
+                )
 
         inputs = self.tokenizer(templated, return_tensors="pt").to(self.device)
         gen_out = self.model.generate(
@@ -346,14 +363,15 @@ class Qwen3Forcing:
             tokenize=False,
             add_generation_prompt=True,
         )
-        templated = header + f"<think>\n{think_prefix}{QWEN3_SPECIAL_STOPPING_PROMPT}"
-        
-        if self.model_name == "deepseek-ai/DeepSeek-R1-Distill-Llama-70B":
-            templated = templated.replace(  # it is because LLama tokenier adds <think> tag by itself
-                '<think>\n<think>', '<think>'
-            )
-            
-            templated += '\\boxed{'
+        if 'gpt-oss-20b' in self.model_name.lower():
+            templated = header + f"<|start|>analysis<|message|>{think_prefix}<|end|><|start|>final<|message|>"
+        else:
+            templated = header + f"<think>\n{think_prefix}{QWEN3_SPECIAL_STOPPING_PROMPT}"
+            if "deepseek" in self.model_name.lower():
+                templated = templated.replace(
+                    '<think>\n<think>', '<think>'
+                )
+                templated += '\\boxed{'
 
         inputs = self.tokenizer(templated, return_tensors="pt").to(self.device)
         outputs = self.model(**inputs)
@@ -416,7 +434,7 @@ def extract_letter(text: Optional[str]) -> Optional[str]:
 
 
 def compute_predictions_per_prefix(
-    forcing: Qwen3Forcing,
+    forcing: ModelForcing,
     prompt_text: str,
     chunks: List[str],
     system_prompt: Optional[str],
@@ -461,7 +479,7 @@ def compute_predictions_per_prefix(
 
 
 def compute_letter_probs_only(
-    forcing: Qwen3Forcing,
+    forcing: ModelForcing,
     prompt_text: str,
     chunks: List[str],
     system_prompt: Optional[str],
@@ -542,8 +560,8 @@ def compute_metrics(
 def run(
     sqlite_db: str = "reasoning_traces.sqlite",
     source_table_name: str = "reasoning_traces_gpqa",
-    where_model_path: str = "deepseek/DeepSeek-R1-Distill-Llama-70B", #"Qwen/Qwen3-32B",
-    model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B", #"Qwen/Qwen3-32B",
+    where_model_path: str = "openai/gpt-oss-20b", #"deepseek/DeepSeek-R1-Distill-Llama-70B", #"Qwen/Qwen3-32B",
+    model_name: str = "openai/gpt-oss-20b", #"deepseek-ai/DeepSeek-R1-Distill-Llama-70B", #"Qwen/Qwen3-32B",
     system_prompt: str = "Answer only with a letter of a correct choice.",
     limit: Optional[int] = None,
     offset: int = 0,
@@ -589,7 +607,7 @@ def run(
 
     # --- Conditional Model Loading ---
     logger.info(f"{len(rows)} rows found. Now loading model: %s", model_name)
-    forcing = Qwen3Forcing(model_name, device_map=device_map)
+    forcing = ModelForcing(model_name, device_map=device_map)
 
     # Note: `model_name` used in DB queries before this point is the one from args.
     # Now we use `forcing.model_name` which is the canonical one after loading.
@@ -610,7 +628,7 @@ def run(
         logger.info(f"Filtered {initial_count} rows down to {len(rows_to_process)} for fast backfill.")
 
         for row in tqdm(rows_to_process, desc="Fast backfilling letter_probs"):
-            think = extract_think_content(row.full_prompt_text)
+            think = extract_think_content_for_row(row)
             if not think:
                 continue
             chunks = split_reasoning_chain(think)
@@ -676,7 +694,7 @@ def run(
 
     for row in tqdm(rows, desc="Processing traces"):
         # Filters have already been applied above
-        think = extract_think_content(row.full_prompt_text)
+        think = extract_think_content_for_row(row)
         if not think:
             # Note: We don't upsert empty metrics here anymore because this mode is for backfilling.
             # If a row has no think content, it will just be skipped.

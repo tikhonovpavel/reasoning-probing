@@ -69,7 +69,7 @@ def process_item(args):
             
             response_data = response.json()
             choice = response_data['choices'][0]
-            final_answer = choice['message'].get('content', '')
+            final_answer = choice['message'].get('content', '').strip()
             
             # if with_reasoning:
             reasoning = choice['message'].get('reasoning', '')
@@ -79,6 +79,7 @@ def process_item(args):
                 time.sleep(2) # Wait a bit before retrying
                 continue
             
+            reasoning = reasoning.strip()
             
             if 'Qwen3' in model_name:
                 assistant_content = f"<think>\n{reasoning}\n</think>\n{final_answer}"
@@ -123,6 +124,23 @@ def process_item(args):
                     full_text = full_text.replace(
                         '</THINK>', '</think>'
                     )
+
+            elif 'gpt-oss-20b' in model_name:
+                assistant_response_text = f"<|start|>analysis<|message|>{reasoning}<|end|><|start|>final<|message|>{final_answer}<|return|>"
+                prompt_conversation = [
+                    {"role": "user", "content": item['prompt']}
+                ]
+                if include_no_think_instruction:
+                    prompt_conversation.insert(0, {"role": "system", "content": "Respond only with the letter of the correct option. Don't write any explanations"})
+                
+                prompt_text = tokenizer.apply_chat_template(
+                    prompt_conversation,
+                    tokenize=False,
+                    add_generation_prompt=False
+                )
+                full_text = prompt_text + assistant_response_text
+            else:
+                raise ValueError(f"Model family for '{model_name}' is not supported for prompt reconstruction.")
 
             # Extract the letter from the final answer
             matches = re.findall(r'[A-D]', final_answer)
@@ -171,7 +189,7 @@ def process_item(args):
 
 
 def main(
-    model_name: str = "deepseek/deepseek-r1-distill-llama-70b", #"Qwen/Qwen3-32B",
+    model_name: str = "openai/gpt-oss-20b", #"deepseek/deepseek-r1-distill-llama-70b", #"Qwen/Qwen3-32B",
     dataset_name: str = "gpqa",
     dataset_config: str = "gpqa_main",
     dataset_split: str = "train",

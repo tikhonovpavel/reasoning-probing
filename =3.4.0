@@ -1,0 +1,2 @@
+Requirement already satisfied: triton in /home/tikhonov/.conda/envs/condaenv/lib/python3.10/site-packages (3.3.0)
+Requirement already satisfied: setuptools>=40.8.0 in /home/tikhonov/.conda/envs/condaenv/lib/python3.10/site-packages (from triton) (72.1.0)

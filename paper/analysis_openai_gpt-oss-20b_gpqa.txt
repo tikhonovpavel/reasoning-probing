@@ -1,0 +1,155 @@
+/disk/4tb/tikhonov/projects/reasoning-probing/analyze_accuracy_vs_length.py:157: FutureWarning: The default of observed=False is deprecated and will be changed to True in a future version of pandas. Pass observed=False to retain current behavior or observed=True to adopt the future default and silence this warning.
+  plot_df['total_in_bin'] = plot_df.groupby('num_chunks_range')['count'].transform('sum')
+/disk/4tb/tikhonov/projects/reasoning-probing/analyze_accuracy_vs_length.py:205: FutureWarning: Series.__getitem__ treating keys as positions is deprecated. In a future version, integer keys will always be treated as labels (consistent with DataFrame behavior). To access a value by position, use `ser.iloc[pos]`
+  y_pos = bottoms[j] + height / 2
+2025-09-22 06:24:55,317 - INFO - Binned plot saved to analysis_results/accuracy_vs_length/binned_accuracy_vs_length_by_changes_reasoning_traces_gpqa_openai_gpt-oss-20b.png
+
+--- Accuracy vs. Reasoning Chain Length (Raw) ---
+ num_chunks  accuracy  count
+          1  0.769231    234
+          2  0.507692     65
+          3  0.750000     28
+          4  0.526316     19
+          5  0.250000     12
+          6  0.000000      5
+          7  0.166667      6
+          8  0.285714      7
+          9  0.250000      4
+         10  0.400000      5
+         11  0.000000      5
+         12  0.500000      2
+         13  1.000000      2
+         14  0.600000      5
+         15  0.000000      1
+         16  0.500000      2
+         17  0.000000      3
+         19  0.333333      3
+         20  0.500000      2
+         21  0.500000      2
+         22  0.000000      2
+         23  0.000000      1
+         24  0.000000      1
+         25  1.000000      1
+         27  0.000000      1
+         28  1.000000      2
+         29  1.000000      1
+         30  0.000000      1
+         33  0.000000      1
+----------------------------------------
+
+--- Accuracy vs. Reasoning Chain Length (Binned at >8.0%) ---
+
+--- Bin: 1-1 (Total: 234 examples, 55.3%) ---
+                      accuracy  count  percentage_of_bin  percentage_of_total
+num_changes_category                                                         
+0                         0.77    234             100.00                55.32
+1                         0.00      0               0.00                 0.00
+2                         0.00      0               0.00                 0.00
+3+                        0.00      0               0.00                 0.00
+
+--- Bin: 2-2 (Total: 65 examples, 15.4%) ---
+                      accuracy  count  percentage_of_bin  percentage_of_total
+num_changes_category                                                         
+0                         0.48     42              64.62                 9.93
+1                         0.57     23              35.38                 5.44
+2                         0.00      0               0.00                 0.00
+3+                        0.00      0               0.00                 0.00
+
+--- Bin: 3-4 (Total: 47 examples, 11.1%) ---
+                      accuracy  count  percentage_of_bin  percentage_of_total
+num_changes_category                                                         
+0                         0.71     17              36.17                 4.02
+1                         0.65     23              48.94                 5.44
+2                         0.50      6              12.77                 1.42
+3+                        1.00      1               2.13                 0.24
+
+--- Bin: 5-9 (Total: 34 examples, 8.0%) ---
+                      accuracy  count  percentage_of_bin  percentage_of_total
+num_changes_category                                                         
+0                         0.20     10              29.41                 2.36
+1                         0.38      8              23.53                 1.89
+2                         0.00      7              20.59                 1.65
+3+                        0.22      9              26.47                 2.13
+
+--- Bin: 10-22 (Total: 34 examples, 8.0%) ---
+                      accuracy  count  percentage_of_bin  percentage_of_total
+num_changes_category                                                         
+0                         0.38      8              23.53                 1.89
+1                         0.25      8              23.53                 1.89
+2                         0.43      7              20.59                 1.65
+3+                        0.36     11              32.35                 2.60
+
+--- Bin: 23-33 (Total: 9 examples, 2.1%) ---
+                      accuracy  count  percentage_of_bin  percentage_of_total
+num_changes_category                                                         
+0                         1.00      1              11.11                 0.24
+1                         0.00      2              22.22                 0.47
+2                         1.00      2              22.22                 0.47
+3+                        0.25      4              44.44                 0.95
+------------------------------------------------------------
+========================================
+2025-09-22 06:24:57,170 - INFO - Scatter plot saved to analysis_results/critical_chunk_prob_change/prob_change_scatter_reasoning_traces_gpqa_openai_gpt-oss-20b.png
+2025-09-22 06:24:57,657 - INFO - Histogram saved to analysis_results/critical_chunk_prob_change/prob_change_hist_reasoning_traces_gpqa_openai_gpt-oss-20b.png
+2025-09-22 06:24:57,820 - INFO - Absolute index histogram saved to analysis_results/critical_chunk_prob_change/critical_index_abs_hist_reasoning_traces_gpqa_openai_gpt-oss-20b.png
+2025-09-22 06:24:58,014 - INFO - Relative index histogram saved to analysis_results/critical_chunk_prob_change/critical_index_rel_hist_reasoning_traces_gpqa_openai_gpt-oss-20b.png
+2025-09-22 06:24:58,501 - INFO - Probability change vs. index plot saved to analysis_results/critical_chunk_prob_change/prob_change_vs_index_reasoning_traces_gpqa_openai_gpt-oss-20b.png
+2025-09-22 06:24:58,793 - INFO - Chunks remaining histogram saved to analysis_results/critical_chunk_prob_change/chunks_remaining_hist_reasoning_traces_gpqa_openai_gpt-oss-20b.png
+
+--- Analysis of Probability Change for CORRECT Answer (num_changes = 1) ---
+                               count      mean       std       min       25%       50%       75%       max
+switch_type                                                                                               
+Switch FROM Correct             11.0 -0.605934  0.188708 -0.851445 -0.725001 -0.679483 -0.493647 -0.220760
+Switch Incorrect to Incorrect   20.0 -0.064903  0.074878 -0.257610 -0.088883 -0.030600 -0.012435  0.015978
+Switch TO Correct               33.0  0.801269  0.252101  0.112027  0.738976  0.892619  0.975923  0.999291
+----------------------------------------------------------------------
+
+--- Distribution of Critical Chunk Index (Absolute) ---
+count    64.000000
+mean      3.015625
+std       4.897334
+min       1.000000
+25%       1.000000
+50%       1.000000
+75%       2.000000
+max      32.000000
+
+--- Distribution of Critical Chunk Index (Relative) ---
+count    64.000000
+mean      0.492699
+std       0.180005
+min       0.111111
+25%       0.333333
+50%       0.500000
+75%       0.650543
+max       0.969697
+----------------------------------------------------------------------
+
+--- Distribution of Chunks Remaining After Critical Switch ---
+                               count      mean       std  min  25%  50%  75%   max
+switch_type                                                                       
+Switch FROM Correct             11.0  2.272727  2.901410  0.0  0.0  1.0  3.5   8.0
+Switch Incorrect to Incorrect   20.0  2.250000  3.507511  0.0  0.0  0.0  4.0  13.0
+Switch TO Correct               33.0  1.060606  2.331032  0.0  0.0  0.0  1.0  12.0
+----------------------------------------------------------------------
+========================================
+2025-09-22 06:25:03,627 - INFO - Loading tokenizer for model: openai/gpt-oss-20b
+2025-09-22 06:25:06,395 - INFO - Threshold=0.10 | Coverage=35.22% (149/423) | Precision=70.47% (105/149) | Overall Acc=72.10% | Avg Chunk Savings=5.23 (44.18%) | Avg Token Savings=1583.22 (32.66%)
+2025-09-22 06:25:07,681 - INFO - Threshold=0.20 | Coverage=33.33% (141/423) | Precision=78.01% (110/141) | Overall Acc=74.47% | Avg Chunk Savings=4.48 (36.46%) | Avg Token Savings=1277.12 (25.97%)
+2025-09-22 06:25:08,912 - INFO - Threshold=0.30 | Coverage=32.15% (136/423) | Precision=83.82% (114/136) | Overall Acc=75.65% | Avg Chunk Savings=3.72 (30.96%) | Avg Token Savings=1038.52 (20.77%)
+2025-09-22 06:25:10,013 - INFO - Threshold=0.40 | Coverage=30.02% (127/423) | Precision=89.76% (114/127) | Overall Acc=76.36% | Avg Chunk Savings=2.87 (26.02%) | Avg Token Savings=804.87 (16.43%)
+2025-09-22 06:25:11,141 - INFO - Threshold=0.50 | Coverage=27.90% (118/423) | Precision=91.53% (108/118) | Overall Acc=75.89% | Avg Chunk Savings=2.21 (22.24%) | Avg Token Savings=654.77 (13.20%)
+2025-09-22 06:25:12,141 - INFO - Threshold=0.60 | Coverage=24.82% (105/423) | Precision=95.24% (100/105) | Overall Acc=75.41% | Avg Chunk Savings=2.21 (21.64%) | Avg Token Savings=605.14 (11.90%)
+2025-09-22 06:25:12,909 - INFO - Threshold=0.70 | Coverage=21.04% (89/423) | Precision=94.38% (84/89) | Overall Acc=73.05% | Avg Chunk Savings=1.83 (18.40%) | Avg Token Savings=471.78 (9.98%)
+2025-09-22 06:25:13,436 - INFO - Threshold=0.80 | Coverage=16.55% (70/423) | Precision=95.71% (67/70) | Overall Acc=71.39% | Avg Chunk Savings=1.46 (15.67%) | Avg Token Savings=364.41 (8.34%)
+2025-09-22 06:25:13,830 - INFO - Threshold=0.90 | Coverage=12.06% (51/423) | Precision=96.08% (49/51) | Overall Acc=68.56% | Avg Chunk Savings=1.27 (12.73%) | Avg Token Savings=306.47 (7.09%)
+2025-09-22 06:25:13,831 - INFO - --- Best Heuristic Performance ---
+2025-09-22 06:25:13,831 - INFO - Max Overall Accuracy: 76.36% achieved at Threshold=0.40
+2025-09-22 06:25:13,831 - INFO -   - Coverage: 30.02% (127/423)
+2025-09-22 06:25:13,831 - INFO -   - Precision: 89.76% (114/127)
+2025-09-22 06:25:13,831 - INFO -   - Avg Chunk Savings (per trigger): 2.87 (26.02%)
+2025-09-22 06:25:13,831 - INFO -   - Overall Avg Chunk Savings: 0.86 (36.28%)
+2025-09-22 06:25:13,831 - INFO -   - Avg Token Savings (per trigger): 804.87 (16.43%)
+2025-09-22 06:25:13,831 - INFO -   - Overall Avg Token Savings: 241.65 (21.44%)
+2025-09-22 06:25:13,832 - INFO - ------------------------------------
+2025-09-22 06:25:14,635 - INFO - Absolute trade-off plot saved to analysis_results/jump_heuristic/jump_heuristic_tradeoff_abs_reasoning_traces_gpqa_openai_gpt-oss-20b.png
+2025-09-22 06:25:15,243 - INFO - Percentage trade-off plot saved to analysis_results/jump_heuristic/jump_heuristic_tradeoff_pct_reasoning_traces_gpqa_openai_gpt-oss-20b.png
